@@ -553,6 +553,26 @@ class BinanceClient:
             logger.error(f"Failed to get exchange info: {e}", exc_info=True)
             raise
     
+    async def get_all_ticker_prices(self) -> Dict[str, float]:
+        """
+        一次请求获取所有交易对价格（避免多次 get_symbol_price 触发限流）
+        
+        Returns:
+            Dict[symbol, price]，失败返回空字典
+        """
+        try:
+            data = await self._request('GET', '/fapi/v1/ticker/price', params={}, signed=False)
+            if isinstance(data, list):
+                return {
+                    format_symbol(item.get('symbol', '')): float(item.get('price', 0))
+                    for item in data
+                    if item.get('symbol') and float(item.get('price', 0)) > 0
+                }
+            return {}
+        except Exception as e:
+            logger.debug(f"Failed to get all ticker prices: {e}")
+            return {}
+
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
         """
         获取交易对的当前标记价格（用于计算订单金额）

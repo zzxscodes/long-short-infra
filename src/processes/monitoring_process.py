@@ -213,33 +213,26 @@ class MonitoringProcess:
                 normalized_weights = target_positions_weights
                 logger.debug("Total weight is 0, using original weights")
             
-            # 转换权重为数量
+            # 转换权重为数量（一次 get_all_ticker_prices 获取全市场价，避免 N 次请求触限流）
+            items = [
+                (s, w, abs(w) * available_capital)
+                for s, w in normalized_weights.items()
+                if abs(w) >= 1e-8
+            ]
+            if not items:
+                return {}
+
+            price_map = await client.get_all_ticker_prices()
             target_positions = {}
-            
-            for symbol, weight in normalized_weights.items():
-                if abs(weight) < 1e-8:  # 权重为0，跳过
-                    continue
-                
-                # 计算该交易对应该分配的USDT金额（使用归一化后的权重）
-                target_notional = abs(weight) * available_capital
-                
-                # 获取当前价格
-                try:
-                    current_price = await client.get_symbol_price(symbol)
-                    if current_price and current_price > 0:
-                        # 计算数量
-                        quantity = target_notional / current_price
-                        # 根据方向设置正负（使用归一化后的权重）
-                        quantity = quantity if weight > 0 else -quantity
-                        target_positions[symbol] = quantity
-                    else:
-                        logger.debug(f"Could not get price for {symbol}, using weight as quantity")
-                        # 如果无法获取价格，使用原始权重（可能是数量而不是权重）
-                        target_positions[symbol] = weight
-                except Exception as e:
-                    logger.debug(f"Failed to convert weight to quantity for {symbol}: {e}, using original value")
+            for symbol, weight, target_notional in items:
+                px = price_map.get(symbol) if price_map else None
+                if px and px > 0:
+                    quantity = target_notional / px
+                    quantity = quantity if weight > 0 else -quantity
+                    target_positions[symbol] = quantity
+                else:
                     target_positions[symbol] = weight
-            
+
             logger.info(
                 f"Converted weights to quantities for {account_id}: {len(target_positions)} symbols, "
                 f"total_balance={total_balance:.2f} USDT, "
@@ -374,20 +367,44 @@ class MonitoringProcess:
     
     async def _monitor_all_accounts(self):
         """监控所有账户"""
-        tasks = []
-        
-        for account_id in self.account_clients.keys():
-            task = self._monitor_account(account_id)
-            tasks.append(task)
-        
-        if tasks:
+        account_ids = list(self.account_clients.keys())
+        timeout = config.get('monitoring.account_fetch_timeout', 90)
+
+        async def _monitor_with_timeout(aid: str):
+            try:
+                return await asyncio.wait_for(self._monitor_account(aid), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Account {aid} monitoring timed out after {timeout}s")
+                return {
+                    'account_id': aid,
+                    'error': f'Monitoring timed out after {timeout}s',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                }
+            except Exception as e:
+                logger.warning(f"Account {aid} monitoring failed: {e}")
+                return {
+                    'account_id': aid,
+                    'error': str(e),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                }
+
+        if account_ids:
+            tasks = [_monitor_with_timeout(aid) for aid in account_ids]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 更新监控数据
-            for result in results:
-                if isinstance(result, dict) and 'account_id' in result:
-                    account_id = result['account_id']
-                    self.monitoring_data[account_id] = result
+
+            for i, result in enumerate(results):
+                aid = account_ids[i] if i < len(account_ids) else None
+                if aid is None:
+                    continue
+                if isinstance(result, BaseException):
+                    self.monitoring_data[aid] = {
+                        'account_id': aid,
+                        'error': str(result),
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                    }
+                    logger.warning(f"Account {aid} raised exception: {result}")
+                elif isinstance(result, dict) and 'account_id' in result:
+                    self.monitoring_data[result['account_id']] = result
     
     def _print_monitoring_summary(self):
         """打印监控摘要"""
@@ -477,15 +494,16 @@ class MonitoringProcess:
         
         try:
             while self.running:
-                # 监控所有账户
-                await self._monitor_all_accounts()
-                
-                # 打印摘要
-                self._print_monitoring_summary()
-                
+                try:
+                    # 监控所有账户
+                    await self._monitor_all_accounts()
+                    # 打印摘要
+                    self._print_monitoring_summary()
+                except Exception as e:
+                    logger.error(f"Error in monitoring cycle (continuing): {e}", exc_info=True)
                 # 等待下次检查
                 await asyncio.sleep(self.check_interval)
-                
+
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
         except Exception as e:

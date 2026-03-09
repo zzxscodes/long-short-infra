@@ -364,6 +364,7 @@ execution:
 
 monitoring:
   check_interval: 60
+  account_fetch_timeout: 90  # 单账户监控超时（秒），启动/冷连时 Binance API 可能较慢
 
   # Equity Curve内存限制
   equity_curve_max_cache: 10000  # Equity Curve内存缓存最大记录数（默认10000条，约7小时）

@@ -257,7 +257,12 @@ class DryRunBinanceClient:
         """获取当前持仓（模拟）"""
         logger.debug(f"DRY-RUN: get_positions() - returning {len(self._mock_positions)} positions")
         return self._mock_positions.copy()
-    
+
+    async def get_all_ticker_prices(self) -> Dict[str, float]:
+        """获取所有交易对价格（模拟，返回空字典）"""
+        logger.debug("DRY-RUN: get_all_ticker_prices() - returning empty")
+        return {}
+
     async def get_exchange_info(self) -> Dict:
         """获取交易所信息（根据配置使用真实或模拟）"""
         if self.use_real_exchange_info:
