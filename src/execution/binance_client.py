@@ -467,7 +467,32 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get positions: {e}", exc_info=True)
             raise
-    
+
+    async def create_listen_key(self) -> str:
+        """
+        创建 User Data Stream listenKey（用于 WebSocket 账户/持仓推送）
+
+        Returns:
+            listenKey 字符串
+        """
+        try:
+            data = await self._request('POST', '/fapi/v1/listenKey', signed=True)
+            key = data.get('listenKey', '')
+            if not key:
+                raise ValueError('Empty listenKey in response')
+            return key
+        except Exception as e:
+            logger.error(f"Failed to create listen key: {e}", exc_info=True)
+            raise
+
+    async def keepalive_listen_key(self) -> None:
+        """延长 listenKey 有效期（需在 60 分钟内调用）"""
+        try:
+            await self._request('PUT', '/fapi/v1/listenKey', signed=True)
+        except Exception as e:
+            logger.error(f"Failed to keepalive listen key: {e}", exc_info=True)
+            raise
+
     async def get_position_risk(self, symbol: Optional[str] = None) -> List[Dict]:
         """
         获取持仓风险信息（包括所有交易对，即使持仓为0）

@@ -17,7 +17,10 @@ from ..common.logger import get_logger
 from ..common.ipc import IPCClient, MessageType
 from ..common.process_manager import ProcessManager
 from ..execution.binance_client import BinanceClient
+from ..execution.dry_run_client import DryRunBinanceClient
 from ..monitoring.metrics import get_metrics_calculator
+from ..monitoring.mark_price_cache import MarkPriceCache
+from ..monitoring.account_stream import AccountStream
 from ..monitoring.alert import get_alert_manager
 from ..monitoring.equity_curve import get_equity_curve_tracker
 from ..monitoring.performance import get_performance_monitor
@@ -73,6 +76,19 @@ class MonitoringProcess:
         
         # IPC客户端（可选，用于接收订单执行事件）
         self.ipc_client: Optional[IPCClient] = None
+
+        # WebSocket 数据源（替代 REST，减少限流）
+        self._use_websocket = (
+            config.get('monitoring.use_websocket', True)
+            and execution_mode != 'mock'
+            and all(
+                isinstance(c, BinanceClient) and not isinstance(c, DryRunBinanceClient)
+                for c in self.account_clients.values()
+            )
+        )
+        self._mark_price_cache: Optional[MarkPriceCache] = None
+        self._account_streams: Dict[str, AccountStream] = {}
+        self._ws_tasks: List[asyncio.Task] = []
         
         # 状态
         self.running = False
@@ -213,7 +229,7 @@ class MonitoringProcess:
                 normalized_weights = target_positions_weights
                 logger.debug("Total weight is 0, using original weights")
             
-            # 转换权重为数量（一次 get_all_ticker_prices 获取全市场价，避免 N 次请求触限流）
+            # 转换权重为数量（优先 WebSocket 价格缓存，否则 REST get_all_ticker_prices）
             items = [
                 (s, w, abs(w) * available_capital)
                 for s, w in normalized_weights.items()
@@ -222,7 +238,11 @@ class MonitoringProcess:
             if not items:
                 return {}
 
-            price_map = await client.get_all_ticker_prices()
+            price_map = {}
+            if self._mark_price_cache and self._mark_price_cache.is_ready():
+                price_map = self._mark_price_cache.get_prices()
+            if not price_map:
+                price_map = await client.get_all_ticker_prices()
             target_positions = {}
             for symbol, weight, target_notional in items:
                 px = price_map.get(symbol) if price_map else None
@@ -262,19 +282,24 @@ class MonitoringProcess:
                 logger.warning(f"No client found for account {account_id}")
                 return {}
             
-            # 1. 获取账户信息
+            # 1. 获取账户信息（优先 WebSocket 缓存）
             logger.debug(f"[{account_id}] step 1/4: get_account_info...")
-            account_info = await client.get_account_info()
-            logger.debug(f"[{account_id}] step 1/4 ok")
-            spacing = config.get('monitoring.binance_request_spacing_seconds', 0.5)
-            if spacing > 0:
-                await asyncio.sleep(spacing)
-            # 2. 获取持仓
-            logger.debug(f"[{account_id}] step 2/4: get_positions...")
-            positions = await client.get_positions()
-            logger.debug(f"[{account_id}] step 2/4 ok")
-            if spacing > 0:
-                await asyncio.sleep(spacing)
+            stream = self._account_streams.get(account_id)
+            spacing = 0.0
+            if stream and stream.is_ready():
+                account_info = stream.get_account_info()
+                positions = stream.get_positions()
+                logger.debug(f"[{account_id}] step 1-2/4 ok (WebSocket cache)")
+            else:
+                account_info = await client.get_account_info()
+                logger.debug(f"[{account_id}] step 1/4 ok")
+                spacing = config.get('monitoring.binance_request_spacing_seconds', 0.5)
+                if spacing > 0:
+                    await asyncio.sleep(spacing)
+                positions = await client.get_positions()
+                logger.debug(f"[{account_id}] step 2/4 ok")
+                if spacing > 0:
+                    await asyncio.sleep(spacing)
             # 3. 计算账户指标
             account_metrics = self.metrics_calculator.calculate_account_metrics(
                 account_info, positions
@@ -499,6 +524,23 @@ class MonitoringProcess:
         logger.info(
             f"Monitoring process running, checking every {self.check_interval} seconds..."
         )
+
+        # 启动 WebSocket 数据源（价格 + 账户/持仓）
+        if self._use_websocket and self.account_clients:
+            try:
+                self._mark_price_cache = MarkPriceCache()
+                self._ws_tasks.append(asyncio.create_task(self._mark_price_cache.start()))
+                logger.info("Mark price cache WebSocket started")
+                for account_id, client in self.account_clients.items():
+                    stream = AccountStream(account_id, client, self._mark_price_cache)
+                    if await stream.start():
+                        self._account_streams[account_id] = stream
+                        logger.info(f"Account stream WebSocket started for {account_id}")
+            except Exception as e:
+                logger.warning(f"WebSocket data sources failed to start, falling back to REST: {e}")
+                self._use_websocket = False
+                self._mark_price_cache = None
+                self._account_streams.clear()
         
         # 启动 HTTP 服务器（在后台任务中）
         if FASTAPI_AVAILABLE and self.app:
@@ -525,6 +567,22 @@ class MonitoringProcess:
         """停止监控进程"""
         logger.info("Stopping monitoring process...")
         self.running = False
+
+        # 停止 WebSocket 数据源
+        if self._mark_price_cache:
+            await self._mark_price_cache.stop()
+            self._mark_price_cache = None
+        for stream in self._account_streams.values():
+            await stream.stop()
+        self._account_streams.clear()
+        for t in self._ws_tasks:
+            if not t.done():
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        self._ws_tasks.clear()
         
         # 停止 HTTP 服务器
         await self._stop_http_server()

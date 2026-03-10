@@ -373,6 +373,17 @@ monitoring:
   # 监控轮次内相邻 Binance API 调用的最小间隔（秒），避免瞬时突发加重限流
   binance_request_spacing_seconds: 0.5
 
+  # WebSocket 数据源（替代 REST 轮询，减少限流）
+  use_websocket: true  # 启用时：价格用 !markPrice@arr，账户/持仓用 User Data Stream
+  mark_price_update_speed: "3s"  # "3s" 或 "1s"
+  mark_price_ping_interval_seconds: 20
+  mark_price_ping_timeout_seconds: 30
+  mark_price_open_timeout_seconds: 30
+  account_stream_keepalive_minutes: 30  # listenKey 保活间隔
+  account_stream_ping_interval_seconds: 20
+  account_stream_ping_timeout_seconds: 30
+  account_stream_open_timeout_seconds: 30
+
   # Equity Curve内存限制
   equity_curve_max_cache: 10000  # Equity Curve内存缓存最大记录数（默认10000条，约7小时）
   position_history_limit: 500  # 持仓历史数据内存缓存最大记录数（默认500条）
