@@ -285,6 +285,51 @@
         .report-item strong {
             color: #4fc3f7;
         }
+        /* 账户作为顶层 Tab，内容区三块同时展示 */
+        .account-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #2a2f3e;
+            flex-wrap: wrap;
+        }
+        .account-tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            color: #9e9e9e;
+            border-bottom: 3px solid transparent;
+            transition: all 0.2s;
+            font-weight: 500;
+        }
+        .account-tab:hover { color: #e4e4e4; }
+        .account-tab.active {
+            color: #4fc3f7;
+            border-bottom-color: #4fc3f7;
+        }
+        .account-content { display: none; }
+        .account-content.active { display: block; }
+        .account-three-blocks { display: grid; grid-template-rows: auto auto 1fr; gap: 20px; }
+        .account-block {
+            background: #1a1f2e;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid #2a2f3e;
+        }
+        .account-block h3 {
+            color: #4fc3f7;
+            font-size: 16px;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #2a2f3e;
+        }
+        .account-block.loading {
+            min-height: 120px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #9e9e9e;
+        }
+        .account-block .chart-wrap { position: relative; height: 320px; }
     </style>
 </head>
 <body>
@@ -329,6 +374,12 @@
     <script>
         let autoRefreshInterval = null;
         const API_BASE = window.location.origin;
+        // 标记账户区域是否已经完成初始化（避免每次刷新重建 DOM，导致图表/报告闪烁）
+        let accountsInitialized = false;
+        // 记录每个账号上次刷新 Equity Curve 的时间戳（ms）
+        const lastEquityRefresh = {};
+        // 记录每个账号上次用于判断是否需要刷新策略报告的状态
+        const lastReportState = {};
         
         // 确保 Chart.js 加载完成后再执行
         function waitForChartJS(callback, maxWait = 10000) {
@@ -620,106 +671,238 @@
             if (!data) return;
             
             const container = document.getElementById('accountsContainer');
-            container.innerHTML = '';
+            const accountIds = Object.keys(data);
+            if (accountIds.length === 0) {
+                container.innerHTML = '';
+                accountsInitialized = false;
+                return;
+            }
             
-            for (const [accountId, accountData] of Object.entries(data)) {
-                if (accountData.error) {
-                    const card = document.createElement('div');
-                    card.className = 'account-card';
-                    card.innerHTML = `
-                        <div class="account-header">
-                            <span class="account-name">${accountId}</span>
+            // 初始化：第一次渲染账户 Tab + 内容骨架
+            if (!accountsInitialized) {
+                container.innerHTML = '';
+                
+                // 默认选中的账号
+                const currentId = accountIds[0];
+                
+                // 账户 Tab 栏（账户作为顶层 Tab）
+                const tabsWrap = document.createElement('div');
+                tabsWrap.className = 'account-tabs';
+                accountIds.forEach(accountId => {
+                    const tab = document.createElement('div');
+                    tab.className = 'account-tab' + (accountId === currentId ? ' active' : '');
+                    tab.textContent = accountId;
+                    tab.dataset.accountId = accountId;
+                    tab.onclick = () => switchAccountTab(accountId);
+                    tabsWrap.appendChild(tab);
+                });
+                container.appendChild(tabsWrap);
+                
+                // 每个账号一个内容区：三块同时展示（账户指标 + Equity Curve + 策略报告）
+                accountIds.forEach(accountId => {
+                    const accountData = data[accountId];
+                    const content = document.createElement('div');
+                    content.id = `account-content-${accountId}`;
+                    content.className = 'account-content' + (accountId === currentId ? ' active' : '');
+                    
+                    if (accountData.error) {
+                        content.innerHTML = `
+                            <div class="account-block">
+                                <div class="account-header"><span class="account-name">${accountId}</span></div>
+                                <div class="alert">错误: ${accountData.error}</div>
+                            </div>`;
+                        container.appendChild(content);
+                        return;
+                    }
+                    
+                    const metrics = accountData.account_metrics || {};
+                    const exposure = accountData.exposure || {};
+                    const deviation = accountData.deviation || {};
+                    const alerts = accountData.alerts || [];
+                    let alertsHtml = alerts.length > 0
+                        ? '<div class="alert">' + alerts.map(a => a.message).join('<br>') + '</div>'
+                        : '';
+                    
+                    content.innerHTML = `
+                        <div class="account-three-blocks">
+                            <div class="account-block" id="${accountId}-block-metrics">
+                                <div class="account-header" style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #2a2f3e;">
+                                    <span class="account-name">账户: ${accountId}</span>
+                                    ${alerts.length > 0 ? `<span class="alerts-count">${alerts.length} 个告警</span>` : ''}
+                                </div>
+                                ${alertsHtml}
+                                <h3>账户指标</h3>
+                                <div class="metric"><span class="metric-label">总余额:</span><span class="metric-value">${formatNumber(metrics.total_wallet_balance)} USDT</span></div>
+                                <div class="metric"><span class="metric-label">可用余额:</span><span class="metric-value">${formatNumber(metrics.available_balance)} USDT</span></div>
+                                <div class="metric"><span class="metric-label">未实现盈亏:</span><span class="metric-value">${formatNumber(metrics.total_unrealized_pnl)} USDT</span></div>
+                                <div class="metric"><span class="metric-label">持仓数量:</span><span class="metric-value">${metrics.open_positions_count || 0}</span></div>
+                                <div class="metric"><span class="metric-label">持仓价值:</span><span class="metric-value">${formatNumber(metrics.position_value)} USDT</span></div>
+                                <div class="metric"><span class="metric-label">净敞口:</span><span class="metric-value">${formatNumber(exposure.net_exposure)} USDT</span></div>
+                                <div class="metric"><span class="metric-label">总敞口:</span><span class="metric-value">${formatNumber(exposure.total_exposure)} USDT</span></div>
+                                <div class="metric"><span class="metric-label">平均偏差:</span><span class="metric-value">${formatNumber(deviation.avg_deviation)}</span></div>
+                                <div class="metric"><span class="metric-label">最大偏差:</span><span class="metric-value">${formatNumber(deviation.max_deviation)}</span></div>
+                                <div class="timestamp" style="margin-top:10px;">更新时间: ${accountData.timestamp ? new Date(accountData.timestamp).toLocaleString('zh-CN') : 'N/A'}</div>
+                            </div>
+                            <div class="account-block" id="${accountId}-block-equity">
+                                <h3>Equity Curve</h3>
+                                <div id="${accountId}-equity">
+                                    <div class="chart-wrap"><canvas id="${accountId}-equity-chart"></canvas></div>
+                                    <div id="${accountId}-equity-summary"></div>
+                                </div>
+                                <div id="${accountId}-equity-loading" class="loading" style="display:none;">加载中...</div>
+                            </div>
+                        <div class="account-block" id="${accountId}-block-report">
+                            <h3>策略报告</h3>
+                            <div id="${accountId}-report-content" data-loaded="false">加载中...</div>
+                            <div class="timestamp" id="${accountId}-report-timestamp" style="margin-top:10px;">
+                                上次刷新时间: --
+                            </div>
                         </div>
-                        <div class="alert">错误: ${accountData.error}</div>
-                    `;
-                    container.appendChild(card);
-                    continue;
+                        </div>`;
+                    container.appendChild(content);
+                });
+                
+                // 仅对当前选中的账号加载 Equity 和 策略报告（并缓存）
+                waitForChartJS(() => {
+                    loadEquityCurve(currentId);
+                });
+                loadStrategyReport(currentId);
+                
+                accountsInitialized = true;
+                return;
+            }
+            
+            // 已初始化：仅更新账户指标等轻量字段，不重建图表/报告 DOM，避免闪烁
+            const tabsWrap = container.querySelector('.account-tabs');
+            const prevActive = tabsWrap ? tabsWrap.querySelector('.account-tab.active') : null;
+            const prevId = prevActive ? prevActive.dataset.accountId : accountIds[0];
+            const currentId = prevId && data[prevId] ? prevId : accountIds[0];
+            
+            // 更新 Tab 状态（不重建元素）
+            if (tabsWrap) {
+                accountIds.forEach(accountId => {
+                    let tab = tabsWrap.querySelector(`.account-tab[data-account-id="${accountId}"]`);
+                    if (!tab) {
+                        tab = document.createElement('div');
+                        tab.className = 'account-tab';
+                        tab.textContent = accountId;
+                        tab.dataset.accountId = accountId;
+                        tab.onclick = () => switchAccountTab(accountId);
+                        tabsWrap.appendChild(tab);
+                    }
+                    tab.classList.toggle('active', accountId === currentId);
+                });
+            }
+            
+            // 更新各账号的指标块
+            accountIds.forEach(accountId => {
+                const accountData = data[accountId];
+                const content = document.getElementById(`account-content-${accountId}`);
+                if (!content) {
+                    // 新增账号时，简单策略：触发整体重建
+                    accountsInitialized = false;
+                    updateAccounts();
+                    return;
+                }
+                
+                if (accountData.error) {
+                    content.innerHTML = `
+                        <div class="account-block">
+                            <div class="account-header"><span class="account-name">${accountId}</span></div>
+                            <div class="alert">错误: ${accountData.error}</div>
+                        </div>`;
+                    return;
                 }
                 
                 const metrics = accountData.account_metrics || {};
                 const exposure = accountData.exposure || {};
                 const deviation = accountData.deviation || {};
                 const alerts = accountData.alerts || [];
+                let alertsHtml = alerts.length > 0
+                    ? '<div class="alert">' + alerts.map(a => a.message).join('<br>') + '</div>'
+                    : '';
                 
-                const card = document.createElement('div');
-                card.className = 'account-card';
-                
-                let alertsHtml = '';
-                if (alerts.length > 0) {
-                    alertsHtml = '<div class="alert">' + alerts.map(a => a.message).join('<br>') + '</div>';
+                const metricsBlock = document.getElementById(`${accountId}-block-metrics`);
+                if (metricsBlock) {
+                    metricsBlock.innerHTML = `
+                        <div class="account-header" style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #2a2f3e;">
+                            <span class="account-name">账户: ${accountId}</span>
+                            ${alerts.length > 0 ? `<span class="alerts-count">${alerts.length} 个告警</span>` : ''}
+                        </div>
+                        ${alertsHtml}
+                        <h3>账户指标</h3>
+                        <div class="metric"><span class="metric-label">总余额:</span><span class="metric-value">${formatNumber(metrics.total_wallet_balance)} USDT</span></div>
+                        <div class="metric"><span class="metric-label">可用余额:</span><span class="metric-value">${formatNumber(metrics.available_balance)} USDT</span></div>
+                        <div class="metric"><span class="metric-label">未实现盈亏:</span><span class="metric-value">${formatNumber(metrics.total_unrealized_pnl)} USDT</span></div>
+                        <div class="metric"><span class="metric-label">持仓数量:</span><span class="metric-value">${metrics.open_positions_count || 0}</span></div>
+                        <div class="metric"><span class="metric-label">持仓价值:</span><span class="metric-value">${formatNumber(metrics.position_value)} USDT</span></div>
+                        <div class="metric"><span class="metric-label">净敞口:</span><span class="metric-value">${formatNumber(exposure.net_exposure)} USDT</span></div>
+                        <div class="metric"><span class="metric-label">总敞口:</span><span class="metric-value">${formatNumber(exposure.total_exposure)} USDT</span></div>
+                        <div class="metric"><span class="metric-label">平均偏差:</span><span class="metric-value">${formatNumber(deviation.avg_deviation)}</span></div>
+                        <div class="metric"><span class="metric-label">最大偏差:</span><span class="metric-value">${formatNumber(deviation.max_deviation)}</span></div>
+                        <div class="timestamp" style="margin-top:10px;">更新时间: ${accountData.timestamp ? new Date(accountData.timestamp).toLocaleString('zh-CN') : 'N/A'}</div>
+                    `;
                 }
                 
-                card.innerHTML = `
-                    <div class="account-header">
-                        <span class="account-name">账户: ${accountId}</span>
-                        ${alerts.length > 0 ? `<span class="alerts-count">${alerts.length} 个告警</span>` : ''}
-                    </div>
-                    ${alertsHtml}
-                    
-                    <div class="tabs">
-                        <div class="tab active" onclick="switchTab('${accountId}', 'metrics')">账户指标</div>
-                        <div class="tab" onclick="switchTab('${accountId}', 'equity')">Equity Curve</div>
-                        <div class="tab" onclick="switchTab('${accountId}', 'report')">策略报告</div>
-                    </div>
-                    
-                    <div id="${accountId}-metrics" class="tab-content active">
-                        <div class="metric">
-                            <span class="metric-label">总余额:</span>
-                            <span class="metric-value">${formatNumber(metrics.total_wallet_balance)} USDT</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">可用余额:</span>
-                            <span class="metric-value">${formatNumber(metrics.available_balance)} USDT</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">未实现盈亏:</span>
-                            <span class="metric-value">${formatNumber(metrics.total_unrealized_pnl)} USDT</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">持仓数量:</span>
-                            <span class="metric-value">${metrics.open_positions_count || 0}</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">持仓价值:</span>
-                            <span class="metric-value">${formatNumber(metrics.position_value)} USDT</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">净敞口:</span>
-                            <span class="metric-value">${formatNumber(exposure.net_exposure)} USDT</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">总敞口:</span>
-                            <span class="metric-value">${formatNumber(exposure.total_exposure)} USDT</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">平均偏差:</span>
-                            <span class="metric-value">${formatNumber(deviation.avg_deviation)}</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">最大偏差:</span>
-                            <span class="metric-value">${formatNumber(deviation.max_deviation)}</span>
-                        </div>
-                    </div>
-                    
-                    <div id="${accountId}-equity" class="tab-content">
-                        <div class="chart-container">
-                            <canvas id="${accountId}-equity-chart"></canvas>
-                        </div>
-                        <div id="${accountId}-equity-summary"></div>
-                    </div>
-                    
-                    <div id="${accountId}-report" class="tab-content">
-                        <div id="${accountId}-report-content">加载中...</div>
-                    </div>
-                    
-                    <div class="timestamp">更新时间: ${accountData.timestamp ? new Date(accountData.timestamp).toLocaleString('zh-CN') : 'N/A'}</div>
-                `;
-                container.appendChild(card);
-                
-                // 加载Equity Curve和策略报告（等待 Chart.js 加载完成）
+                // 切换当前账号内容可见状态
+                content.classList.toggle('active', accountId === currentId);
+
+                // ---- 决定是否需要刷新策略报告（仅当前账号） ----
+                const stateKey = accountId;
+                const prev = lastReportState[stateKey] || {};
+                const curr = {
+                    positions_count: metrics.open_positions_count || 0,
+                    total_wallet_balance: metrics.total_wallet_balance || 0,
+                };
+
+                const balanceDelta = Math.abs(
+                    (curr.total_wallet_balance || 0) - (prev.total_wallet_balance || 0)
+                );
+
+                const needRefreshReport =
+                    prev.positions_count === undefined ||
+                    (prev.positions_count === 0 && curr.positions_count > 0) ||
+                    (curr.positions_count > 0 && balanceDelta > 0.5); // 余额变化超过 0.5 USDT 触发
+
+                if (accountId === currentId && needRefreshReport) {
+                    const reportDiv = document.getElementById(`${accountId}-report-content`);
+                    if (reportDiv && reportDiv.dataset.loaded === 'true') {
+                        reportDiv.dataset.loaded = 'false';
+                        reportDiv.innerHTML = '加载中...';
+                        loadStrategyReport(accountId);
+                    }
+                }
+
+                lastReportState[stateKey] = curr;
+            });
+
+            // ---- 按节流间隔刷新当前账号的 Equity Curve（不重建外框架） ----
+            const now = Date.now();
+            const equityIntervalMs = 15000; // 15 秒刷新一次
+            if (
+                !lastEquityRefresh[currentId] ||
+                now - lastEquityRefresh[currentId] >= equityIntervalMs
+            ) {
                 waitForChartJS(() => {
-                    loadEquityCurve(accountId);
+                    loadEquityCurve(currentId);
                 });
+                lastEquityRefresh[currentId] = now;
+            }
+        }
+        
+        function switchAccountTab(accountId) {
+            const container = document.getElementById('accountsContainer');
+            container.querySelectorAll('.account-tab').forEach(t => {
+                t.classList.toggle('active', t.dataset.accountId === accountId);
+            });
+            container.querySelectorAll('.account-content').forEach(c => {
+                c.classList.toggle('active', c.id === `account-content-${accountId}`);
+            });
+            // 若该账号尚未加载过 Equity / 报告，则加载
+            if (!document.getElementById(`${accountId}-equity-chart`) || !equityCharts[accountId]) {
+                waitForChartJS(() => loadEquityCurve(accountId));
+            }
+            if (document.getElementById(`${accountId}-report-content`) && document.getElementById(`${accountId}-report-content`).textContent === '加载中...') {
                 loadStrategyReport(accountId);
             }
         }
@@ -765,18 +948,6 @@
         }
         
         const equityCharts = {};
-        
-        function switchTab(accountId, tabName) {
-            // 更新标签页状态
-            const tabs = document.querySelectorAll(`#accountsContainer .account-card:has([id="${accountId}-metrics"]) .tab`);
-            tabs.forEach(tab => tab.classList.remove('active'));
-            event.target.classList.add('active');
-            
-            // 更新内容显示
-            const contents = document.querySelectorAll(`#accountsContainer .account-card:has([id="${accountId}-metrics"]) .tab-content`);
-            contents.forEach(content => content.classList.remove('active'));
-            document.getElementById(`${accountId}-${tabName}`).classList.add('active');
-        }
         
         async function loadEquityCurve(accountId) {
             try {
@@ -990,10 +1161,17 @@
         
         async function loadStrategyReport(accountId) {
             try {
+                const container = document.getElementById(`${accountId}-report-content`);
+                if (!container) return;
                 const report = await fetchAPI(`/api/strategy-report/${accountId}`);
                 if (!report || Object.keys(report).length === 0) {
-                    document.getElementById(`${accountId}-report-content`).innerHTML = 
+                    container.innerHTML = 
                         '<div style="padding: 20px; text-align: center; color: #9e9e9e;">暂无策略报告数据</div>';
+                    container.dataset.loaded = 'true';
+                    const ts = document.getElementById(`${accountId}-report-timestamp`);
+                    if (ts) {
+                        ts.textContent = `上次刷新时间: ${new Date().toLocaleString('zh-CN')}`;
+                    }
                     return;
                 }
                 
@@ -1055,13 +1233,26 @@
                     html += '</div>';
                 }
                 
-                document.getElementById(`${accountId}-report-content`).innerHTML = html || 
+                container.innerHTML = html || 
                     '<div style="padding: 20px; text-align: center; color: #9e9e9e;">暂无策略报告数据</div>';
+                container.dataset.loaded = 'true';
+                const ts = document.getElementById(`${accountId}-report-timestamp`);
+                if (ts) {
+                    ts.textContent = `上次刷新时间: ${new Date().toLocaleString('zh-CN')}`;
+                }
                 
             } catch (error) {
                 console.error(`Error loading strategy report for ${accountId}:`, error);
-                document.getElementById(`${accountId}-report-content`).innerHTML = 
-                    '<div style="padding: 20px; text-align: center; color: #ff6b6b;">加载策略报告失败</div>';
+                const container = document.getElementById(`${accountId}-report-content`);
+                if (container) {
+                    container.innerHTML = 
+                        '<div style="padding: 20px; text-align: center; color: #ff6b6b;">加载策略报告失败</div>';
+                    container.dataset.loaded = 'true';
+                    const ts = document.getElementById(`${accountId}-report-timestamp`);
+                    if (ts) {
+                        ts.textContent = `上次刷新时间: ${new Date().toLocaleString('zh-CN')}`;
+                    }
+                }
             }
         }
         
