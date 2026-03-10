@@ -5,16 +5,13 @@ binance:
 
 # 网络请求限流配置（防止触发Binance API限流和IP封禁）
 # 参考: Binance Futures /fapi/v1/exchangeInfo rateLimits
-#   - REQUEST_WEIGHT: 2400/分钟/IP（按权重，非请求数）
-#   - 多进程（data_layer/execution/monitoring/collectors）共享同一IP，需分摊
-#   - 限流按IP，非按API Key；超限触发429，反复违规触发418封禁（2分钟~3天）
+#   - REQUEST_WEIGHT: 2400/分钟/IP（按权重，非请求数；account/position 等端点 weight=5）
+#   - 多进程共享同一IP且限流器不共享，总请求=各进程之和，需按进程数分摊
+#   - 2400 weight / ~7进程 / 平均weight~4 ≈ 85 req/进程/分钟，取 80 留余量
 network:
-  # 每秒最大请求数（Binance推荐：10 req/s，多进程共享时更保守）
-  max_requests_per_second: 5.0
-  # 每分钟最大请求数（每进程分摊：2400 weight / ~6进程 / 平均权重≈2 → 约200）
-  max_requests_per_minute: 200
-  # 突发请求允许数量（令牌桶大小）
-  burst_size: 10
+  max_requests_per_second: 3.0
+  max_requests_per_minute: 80
+  burst_size: 5
   max_ip_ban_wait_seconds: 120  # IP封禁时最大等待秒数，超过则直接抛出避免阻塞（监控90s超时）
   max_minute_limit_wait_seconds: 45  # 分钟级限流等待上限，超过则抛异常避免监控90s超时
 
@@ -372,7 +369,9 @@ execution:
 
 monitoring:
   check_interval: 60
-  account_fetch_timeout: 90  # 单账户监控超时（秒），启动/冷连时 Binance API 可能较慢
+  account_fetch_timeout: 150  # 单账户监控超时（秒，适当放宽以容忍网络抖动）
+  # 监控轮次内相邻 Binance API 调用的最小间隔（秒），避免瞬时突发加重限流
+  binance_request_spacing_seconds: 0.5
 
   # Equity Curve内存限制
   equity_curve_max_cache: 10000  # Equity Curve内存缓存最大记录数（默认10000条，约7小时）

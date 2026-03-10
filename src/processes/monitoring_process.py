@@ -266,11 +266,15 @@ class MonitoringProcess:
             logger.debug(f"[{account_id}] step 1/4: get_account_info...")
             account_info = await client.get_account_info()
             logger.debug(f"[{account_id}] step 1/4 ok")
+            spacing = config.get('monitoring.binance_request_spacing_seconds', 0.5)
+            if spacing > 0:
+                await asyncio.sleep(spacing)
             # 2. 获取持仓
             logger.debug(f"[{account_id}] step 2/4: get_positions...")
             positions = await client.get_positions()
             logger.debug(f"[{account_id}] step 2/4 ok")
-            
+            if spacing > 0:
+                await asyncio.sleep(spacing)
             # 3. 计算账户指标
             account_metrics = self.metrics_calculator.calculate_account_metrics(
                 account_info, positions
@@ -298,6 +302,8 @@ class MonitoringProcess:
                 logger.warning(f"Failed to load target positions for {account_id}: {e}")
             
             # 5. 将权重转换为实际数量（与执行进程保持一致）
+            if spacing > 0:
+                await asyncio.sleep(spacing)
             logger.debug(f"[{account_id}] step 3/4: _convert_weights_to_quantities...")
             target_positions = await self._convert_weights_to_quantities(
                 account_id, client, target_positions_weights, account_info

@@ -71,7 +71,8 @@ class UniverseManager:
                     url,
                     max_retries=3,
                     timeout=30.0,
-                    return_json=True
+                    return_json=True,
+                    use_rate_limit=True,
                 )
                 symbols = data.get('symbols', [])
                 

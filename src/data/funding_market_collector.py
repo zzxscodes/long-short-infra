@@ -408,7 +408,9 @@ class FundingMarketCollector:
                 'GET',
                 url,
                 params=params,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=10.0,
+                return_json=True,
+                use_rate_limit=True,
             )
 
             if data and isinstance(data, list):

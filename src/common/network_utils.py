@@ -154,12 +154,14 @@ async def safe_http_request(
                         f"服务器错误 {response.status}: {error_text[:200]}"
                     )
                 elif response.status == 429:
-                    # 限流（Binance 文档：Retry-After 为需等待秒数），可重试
+                    # 限流（Binance 文档：Retry-After 为需等待秒数），通知限流器让同进程其它请求也退避
                     retry_after_raw = response.headers.get('Retry-After', '60')
                     try:
-                        retry_sec = min(float(retry_after_raw), 120.0)  # 解析秒数，上限120s
+                        retry_sec = min(float(retry_after_raw), 120.0)
                     except (ValueError, TypeError):
                         retry_sec = min(delay, 60.0)
+                    if rate_limiter:
+                        rate_limiter.record_429_backoff(retry_sec)
                     logger.warning(
                         f"API限流 (429), Retry-After: {retry_sec:.0f}秒, "
                         f"尝试 {attempt + 1}/{max_retries + 1}"
@@ -259,21 +261,26 @@ async def safe_http_request(
             else:
                 logger.error(f"HTTP请求最终失败: {url}, 错误: {e}", exc_info=True)
         except IPBannedError as e:
-            # IP被封禁，等待解封
+            # IP被封禁，检查是否在可等待范围内
             last_exception = e
             if e.banned_until:
                 current_ms = int(time.time() * 1000)
                 if current_ms < e.banned_until:
                     wait_seconds = (e.banned_until - current_ms) / 1000.0
+                    max_wait = config.get('network.max_ip_ban_wait_seconds', 120)
+                    if wait_seconds > max_wait:
+                        logger.error(
+                            f"IP被封禁，需等待 {wait_seconds:.0f}s 解封（超过上限 {max_wait}s），"
+                            f"直接抛出避免阻塞。解封时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.banned_until / 1000))}"
+                        )
+                        raise last_exception
                     logger.error(
                         f"IP被封禁，等待 {wait_seconds:.1f} 秒直到解封 "
                         f"(解封时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.banned_until / 1000))})"
                     )
-                    await asyncio.sleep(wait_seconds + 1)  # 多等1秒确保解封
-                    # 解封后，重置限流器状态
+                    await asyncio.sleep(wait_seconds + 1)
                     if rate_limiter:
                         rate_limiter.ip_banned_until = None
-                    # 继续重试
                     if attempt < max_retries:
                         continue
             raise last_exception
@@ -334,6 +341,12 @@ class RateLimiter:
         
         # IP封禁状态
         self.ip_banned_until: Optional[int] = None  # 解封时间戳（毫秒）
+        # 429 退避：收到 429 后，同进程所有请求需等待到此时间
+        self._429_backoff_until: float = 0.0  # wall time (seconds)
+    
+    def record_429_backoff(self, retry_after_seconds: float):
+        """收到 429 时调用，使后续 acquire 在退避期内等待"""
+        self._429_backoff_until = time.time() + retry_after_seconds
     
     async def acquire(self):
         """
@@ -343,6 +356,13 @@ class RateLimiter:
         """
         async with self.lock:
             current_time = time.time()
+            
+            # 检查 429 退避
+            if current_time < self._429_backoff_until:
+                wait_s = self._429_backoff_until - current_time
+                logger.warning(f"429 退避中，等待 {wait_s:.1f} 秒...")
+                await asyncio.sleep(wait_s)
+                self._429_backoff_until = 0.0
             
             # 检查IP封禁状态
             if self.ip_banned_until is not None:
