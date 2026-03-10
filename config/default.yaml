@@ -4,16 +4,22 @@ binance:
   ws_base: wss://fstream.binance.com
 
 # 网络请求限流配置（防止触发Binance API限流和IP封禁）
+# 参考: Binance Futures /fapi/v1/exchangeInfo rateLimits
+#   - REQUEST_WEIGHT: 2400/分钟/IP（按权重，非请求数）
+#   - 多进程（data_layer/execution/monitoring/collectors）共享同一IP，需分摊
+#   - 限流按IP，非按API Key；超限触发429，反复违规触发418封禁（2分钟~3天）
 network:
-  # 每秒最大请求数（Binance推荐：10 req/s）
-  max_requests_per_second: 10.0
-  # 每分钟最大请求数（Binance限制：1200 req/min）
-  max_requests_per_minute: 1200
+  # 每秒最大请求数（Binance推荐：10 req/s，多进程共享时更保守）
+  max_requests_per_second: 5.0
+  # 每分钟最大请求数（每进程分摊：2400 weight / ~6进程 / 平均权重≈2 → 约200）
+  max_requests_per_minute: 200
   # 突发请求允许数量（令牌桶大小）
-  burst_size: 20
+  burst_size: 10
+  max_ip_ban_wait_seconds: 120  # IP封禁时最大等待秒数，超过则直接抛出避免阻塞（监控90s超时）
+  max_minute_limit_wait_seconds: 45  # 分钟级限流等待上限，超过则抛异常避免监控90s超时
 
-  http_timeout: 30.0  # HTTP请求超时（秒）
-  http_max_retries: 3  # HTTP请求最大重试次数
+  http_timeout: 10.0  # HTTP单次请求超时（秒），缩短以便在90s监控超时内快速失败
+  http_max_retries: 2  # HTTP最大重试次数，减少重试避免单请求总耗时超90s
   websocket_reconnect_delay_base: 1.0  # WebSocket重连延迟基数（秒）
   websocket_reconnect_delay_max: 30.0  # WebSocket重连延迟最大值（秒）
   websocket_reconnect_jitter: 0.5  # WebSocket重连抖动（秒）
@@ -238,10 +244,12 @@ execution:
     completed_orders_max_size: 1000  # 已完成订单缓存最大数量（防止内存无限增长）
     symbol_info_cache_max_size: 500  # Symbol信息缓存最大数量（LRU清理）
   
-  # BinanceClient缓存配置
+  # BinanceClient配置
   binance_client:
     contract_settings_cache_max_size: 500  # 合约设置缓存最大数量
     contract_settings_cache_ttl: 3600  # 合约设置缓存过期时间（秒，默认1小时）
+    recv_window_ms: 120000  # 接收窗口（毫秒），增大以容忍时钟偏差，减少 -1021 错误
+    server_time_sync_ttl_seconds: 3600  # 服务器时间同步TTL（秒），缩短以更频繁对时
   
   # TWAP/VWAP订单配置
   twap:

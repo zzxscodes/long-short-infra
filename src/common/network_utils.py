@@ -154,14 +154,18 @@ async def safe_http_request(
                         f"服务器错误 {response.status}: {error_text[:200]}"
                     )
                 elif response.status == 429:
-                    # 限流，可重试
-                    retry_after = response.headers.get('Retry-After', '60')
+                    # 限流（Binance 文档：Retry-After 为需等待秒数），可重试
+                    retry_after_raw = response.headers.get('Retry-After', '60')
+                    try:
+                        retry_sec = min(float(retry_after_raw), 120.0)  # 解析秒数，上限120s
+                    except (ValueError, TypeError):
+                        retry_sec = min(delay, 60.0)
                     logger.warning(
-                        f"API限流 (429), Retry-After: {retry_after}秒, "
+                        f"API限流 (429), Retry-After: {retry_sec:.0f}秒, "
                         f"尝试 {attempt + 1}/{max_retries + 1}"
                     )
                     if attempt < max_retries:
-                        await asyncio.sleep(float(retry_after) if retry_after.isdigit() else delay)
+                        await asyncio.sleep(retry_sec)
                         delay *= 2
                         continue
                     raise NetworkError(f"API限流，已重试{max_retries}次")
@@ -344,8 +348,16 @@ class RateLimiter:
             if self.ip_banned_until is not None:
                 current_ms = int(current_time * 1000)
                 if current_ms < self.ip_banned_until:
-                    # 仍然被封禁，计算等待时间
                     wait_seconds = (self.ip_banned_until - current_ms) / 1000.0
+                    max_wait = config.get('network.max_ip_ban_wait_seconds', 120)
+                    if wait_seconds > max_wait:
+                        banned_until = self.ip_banned_until
+                        self.ip_banned_until = None
+                        raise IPBannedError(
+                            f"IP被封禁，需等待 {wait_seconds:.0f}s 解封（超过上限 {max_wait}s），"
+                            f"解封时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(banned_until / 1000))}",
+                            banned_until
+                        )
                     logger.warning(
                         f"IP被封禁，等待 {wait_seconds:.1f} 秒直到解封 "
                         f"(解封时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.ip_banned_until / 1000))})"
@@ -376,6 +388,12 @@ class RateLimiter:
                 wait_until = oldest_request_time + 60
                 wait_seconds = wait_until - current_time
                 if wait_seconds > 0:
+                    max_wait = config.get('network.max_minute_limit_wait_seconds', 45)
+                    if wait_seconds > max_wait:
+                        raise NetworkError(
+                            f"达到分钟级限流 ({len(self.request_times)}/{self.max_requests_per_minute})，"
+                            f"需等待 {wait_seconds:.0f}s（超过上限 {max_wait}s），请降低请求频率"
+                        )
                     logger.warning(
                         f"达到分钟级限流 ({len(self.request_times)}/{self.max_requests_per_minute})，"
                         f"等待 {wait_seconds:.1f} 秒..."

@@ -126,9 +126,10 @@ class BinanceClient:
             url = f"{self.api_base}/fapi/v1/time"
             session = await self._get_session()
             
-            # 多次测量取平均值，减少网络延迟影响
+            # 测量取样本（force 时只取1次以加快 -1021 恢复）
             samples = []  # (server_mid_ms, mono_mid_s, rtt_ms)
-            for _ in range(3):
+            n_samples = 1 if force else 3
+            for _ in range(n_samples):
                 try:
                     t0_mono = time.monotonic()
                     # 使用safe_http_request，自动处理限流和错误
@@ -136,8 +137,8 @@ class BinanceClient:
                         session,
                         'GET',
                         url,
-                        max_retries=2,
-                        timeout=10.0,
+                        max_retries=1 if force else 2,
+                        timeout=5.0 if force else 10.0,
                         return_json=True,
                         use_rate_limit=True  # 启用请求限流
                     )
@@ -272,13 +273,15 @@ class BinanceClient:
                 request_kwargs['data'] = params
             
             # 使用安全的HTTP请求（带重试和限流）
+            http_timeout = float(config.get('network.http_timeout', 10.0))
+            http_max_retries = int(config.get('network.http_max_retries', 2))
             try:
                 data = await safe_http_request(
                     session,
                     method,
                     url,
-                    max_retries=3,
-                    timeout=30.0,
+                    max_retries=http_max_retries,
+                    timeout=http_timeout,
                     return_json=True,
                     use_rate_limit=True,  # 启用请求限流
                     **request_kwargs
@@ -322,7 +325,7 @@ class BinanceClient:
                                 method,
                                 url,
                                 max_retries=1,  # 只重试一次
-                                timeout=30.0,
+                                timeout=http_timeout,
                                 return_json=True,
                                 use_rate_limit=True,
                                 **request_kwargs
@@ -377,7 +380,7 @@ class BinanceClient:
                             method,
                             url,
                             max_retries=1,  # 只重试一次
-                            timeout=30.0,
+                            timeout=http_timeout,
                             return_json=True,
                             use_rate_limit=True,
                             **request_kwargs

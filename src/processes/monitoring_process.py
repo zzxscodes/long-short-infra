@@ -263,10 +263,13 @@ class MonitoringProcess:
                 return {}
             
             # 1. 获取账户信息
+            logger.debug(f"[{account_id}] step 1/4: get_account_info...")
             account_info = await client.get_account_info()
-            
+            logger.debug(f"[{account_id}] step 1/4 ok")
             # 2. 获取持仓
+            logger.debug(f"[{account_id}] step 2/4: get_positions...")
             positions = await client.get_positions()
+            logger.debug(f"[{account_id}] step 2/4 ok")
             
             # 3. 计算账户指标
             account_metrics = self.metrics_calculator.calculate_account_metrics(
@@ -295,9 +298,11 @@ class MonitoringProcess:
                 logger.warning(f"Failed to load target positions for {account_id}: {e}")
             
             # 5. 将权重转换为实际数量（与执行进程保持一致）
+            logger.debug(f"[{account_id}] step 3/4: _convert_weights_to_quantities...")
             target_positions = await self._convert_weights_to_quantities(
                 account_id, client, target_positions_weights, account_info
             )
+            logger.debug(f"[{account_id}] step 3/4 ok")
             
             # 6. 计算持仓偏差
             current_positions = {
@@ -335,6 +340,7 @@ class MonitoringProcess:
             monitoring_data['alerts'] = alerts
             monitoring_data['alerts_count'] = len(alerts)
             
+            logger.debug(f"[{account_id}] step 4/4: done")
             # 记录Equity Curve快照
             try:
                 timestamp = datetime.now(timezone.utc)
