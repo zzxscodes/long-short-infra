@@ -748,7 +748,10 @@ class MonitoringProcess:
                         start_date = end_date - timedelta(days=3)
                 
                 report = await report_generator.generate_report(account_id, start_date, end_date)
-                # 清理报告中的NaN和Inf值，避免JSON序列化错误
+                # 报告底层数据最后更新时间（策略执行写持仓历史时更新），供前端判断是否更新时间戳
+                report_data_updated_at = report_generator.get_report_data_updated_at(account_id)
+                if report_data_updated_at:
+                    report["report_data_updated_at"] = report_data_updated_at
                 from ..common.utils import sanitize_for_json
                 cleaned_report = sanitize_for_json(report)
                 return JSONResponse(cleaned_report)

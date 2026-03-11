@@ -98,6 +98,23 @@ class StrategyReportGenerator:
                     f"Trimmed position history for {account_id} to {self.position_history_limit} records"
                 )
 
+    def get_report_data_updated_at(self, account_id: str) -> Optional[str]:
+        """
+        获取策略报告底层数据（持仓历史）最后更新时间。
+        当执行进程记录开仓后写入文件时更新，用于前端判断报告是否有新数据。
+        """
+        try:
+            history_file = (
+                self.position_history_dir / f"{account_id}_position_history.json"
+            )
+            if history_file.exists():
+                with open(history_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data.get("last_updated")
+        except Exception as e:
+            logger.debug(f"Failed to get report_data_updated_at for {account_id}: {e}")
+        return None
+
     def _save_position_history(self, account_id: str) -> None:
         """保存持仓历史数据到文件"""
         try:
