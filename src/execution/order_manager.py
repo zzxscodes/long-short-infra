@@ -58,6 +58,11 @@ class OrderManager:
         if self.dry_run:
             logger.info("OrderManager initialized in DRY-RUN mode")
     
+    def _trim_completed_orders_if_needed(self) -> None:
+        """限制 completed_orders 大小，防止内存无限增长"""
+        if len(self.completed_orders) > self.completed_orders_max_size:
+            self.completed_orders = self.completed_orders[-self.completed_orders_max_size:]
+    
     async def execute_target_positions(
         self,
         target_positions: Dict[str, float],
@@ -214,9 +219,7 @@ class OrderManager:
                     }
                     if child_status == 'FILLED':
                         self.completed_orders.append(info)
-                        # 限制completed_orders大小，防止内存无限增长
-                        if len(self.completed_orders) > self.completed_orders_max_size:
-                            self.completed_orders = self.completed_orders[-self.completed_orders_max_size:]
+                        self._trim_completed_orders_if_needed()
                     else:
                         self.pending_orders[str(child_order_id)] = info
                     tracked.append(info)
@@ -311,6 +314,7 @@ class OrderManager:
             if status == 'FILLED':
                 # 完全成交
                 self.completed_orders.append(order_info)
+                self._trim_completed_orders_if_needed()
                 logger.info(
                     f"Order {order_id} for {symbol} filled: {side} {quantity}"
                 )
@@ -393,6 +397,7 @@ class OrderManager:
                         # 已成交
                         order_info['status'] = 'FILLED'
                         self.completed_orders.append(order_info)
+                        self._trim_completed_orders_if_needed()
                         order_ids_to_remove.append(order_id_str)
                         logger.info(f"Order {order_id} for {symbol} completed")
                     elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
@@ -911,6 +916,7 @@ class OrderManager:
                     self.pending_orders.pop(str(order_id), None)
                     order_info['status'] = 'FILLED'
                     self.completed_orders.append(order_info)
+                    self._trim_completed_orders_if_needed()
                     return
                 if status in ['CANCELED', 'EXPIRED', 'REJECTED']:
                     self.pending_orders.pop(str(order_id), None)

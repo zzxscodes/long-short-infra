@@ -983,7 +983,12 @@ class DataLayerProcess:
         # 所以这里直接使用回调传入的数据（已经是真实数据）
         if symbol not in self._ws_funding_rate_buffer:
             self._ws_funding_rate_buffer[symbol] = []
-        self._ws_funding_rate_buffer[symbol].append(data)
+        buf = self._ws_funding_rate_buffer[symbol]
+        buf.append(data)
+        # 单 symbol 缓冲上限，防止 flush 异常时内存无限增长
+        max_per_symbol = int(config.get("data.ws_funding_rate_buffer_max_per_symbol", 500))
+        if len(buf) > max_per_symbol:
+            self._ws_funding_rate_buffer[symbol] = buf[-max_per_symbol:]
         
         logger.debug(
             f"WS funding rate: {symbol} rate={data.get('fundingRate'):.6f} "

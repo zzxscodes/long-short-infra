@@ -448,9 +448,35 @@ class MonitoringProcess:
             # 通知所有 SSE 订阅者：账户数据已更新，前端可立即拉取 /api/accounts 并刷新 equity curve
             for q in list(self._sse_queues):
                 try:
-                    q.put_nowait("accounts_updated")
+                    q.put_nowait({"type": "accounts_updated"})
                 except asyncio.QueueFull:
                     pass
+    
+    async def _watch_report_updated_signals(self):
+        """监听策略报告更新信号：执行进程写入 position_history 后会写 report_updated_{account_id}，检测到则推送 SSE"""
+        signals_dir = Path(config.get("data.signals_directory", "data/signals"))
+        check_interval = 1.5  # 秒
+        while self.running:
+            try:
+                await asyncio.sleep(check_interval)
+                if not signals_dir.exists():
+                    continue
+                for f in signals_dir.glob("report_updated_*"):
+                    try:
+                        account_id = f.stem.replace("report_updated_", "")
+                        if account_id:
+                            for q in list(self._sse_queues):
+                                try:
+                                    q.put_nowait({"type": "report_updated", "account_id": account_id})
+                                except asyncio.QueueFull:
+                                    pass
+                        f.unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.debug(f"Process report_updated signal {f}: {e}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Watch report signals: {e}")
     
     def _print_monitoring_summary(self):
         """打印监控摘要"""
@@ -554,6 +580,9 @@ class MonitoringProcess:
         # 启动 HTTP 服务器（在后台任务中）
         if FASTAPI_AVAILABLE and self.app:
             asyncio.create_task(self._start_http_server())
+        
+        # 启动策略报告信号监听：后台产生新报告时立即推送 SSE，前端马上更新
+        self._ws_tasks.append(asyncio.create_task(self._watch_report_updated_signals()))
         
         try:
             while self.running:
@@ -660,7 +689,13 @@ class MonitoringProcess:
                     while True:
                         try:
                             msg = await asyncio.wait_for(queue.get(), timeout=30.0)
-                            if msg == "accounts_updated":
+                            if isinstance(msg, dict):
+                                if msg.get("type") == "accounts_updated":
+                                    yield f"event: accounts_updated\ndata: {{}}\n\n"
+                                elif msg.get("type") == "report_updated" and msg.get("account_id"):
+                                    import json as _json
+                                    yield f"event: report_updated\ndata: {_json.dumps({'account_id': msg['account_id']})}\n\n"
+                            elif msg == "accounts_updated":
                                 yield f"event: accounts_updated\ndata: {{}}\n\n"
                         except asyncio.TimeoutError:
                             yield ": keepalive\n\n"
@@ -735,6 +770,18 @@ class MonitoringProcess:
             except Exception as e:
                 logger.error(f"Failed to get equity curve: {e}", exc_info=True)
                 return JSONResponse({"error": str(e)}, status_code=500)
+        
+        @self.app.get("/api/strategy-report/{account_id}/updated-at")
+        async def get_strategy_report_updated_at(account_id: str):
+            """轻量接口：仅返回报告底层数据最后更新时间，供前端轮询检测是否有新数据，有变化时再拉取完整报告"""
+            try:
+                from ..monitoring.strategy_report import get_strategy_report_generator
+                report_generator = get_strategy_report_generator()
+                updated_at = report_generator.get_report_data_updated_at(account_id)
+                return JSONResponse({"report_data_updated_at": updated_at})
+            except Exception as e:
+                logger.debug(f"Failed to get report updated-at for {account_id}: {e}")
+                return JSONResponse({"report_data_updated_at": None})
         
         @self.app.get("/api/strategy-report/{account_id}")
         async def get_strategy_report(account_id: str):

@@ -363,7 +363,7 @@
             <button class="refresh-btn" onclick="refreshData()">手动刷新</button>
             <label>
                 <input type="checkbox" id="autoRefresh" checked onchange="toggleAutoRefresh()">
-                自动刷新 (5秒)
+                自动刷新 (10秒)
             </label>
         </div>
     </div>
@@ -378,14 +378,14 @@
         let accountsInitialized = false;
         // 记录每个账号上次刷新 Equity Curve 的时间戳（ms）
         const lastEquityRefresh = {};
-        // 策略报告轮询定时器（后备，SSE 驱动后可不依赖）
-        // 策略报告不参与定时轮询，仅在「数据更新」(SSE)、手动刷新、切换账户时刷新
-        let strategyReportPollTimer = null;
+        // 策略报告：由 SSE report_updated 推送，后台产生新报告时立即刷新，不轮询
         // 无账户更新时，Equity Curve 固定间隔刷新（秒）
         const EQUITY_FIXED_INTERVAL_MS = 15000; // 15 秒
         let equityFixedIntervalTimer = null;
         // SSE 连接（账户数据更新事件驱动）
         let sseEventSource = null;
+        // 策略报告加载 ID：防止多次并发请求中，先完成的超时覆盖后完成的成功内容
+        let strategyReportLoadId = 0;
         // 当前选中的 accountId（用于 SSE 时刷新 equity/report）
         function getActiveAccountId() {
             const tab = document.querySelector('.account-tab.active');
@@ -803,11 +803,10 @@
                     container.appendChild(content);
                 });
                 
-                // 仅对当前选中的账号加载 Equity 和 策略报告（并缓存）
+                // 仅对当前选中的账号加载 Equity（策略报告由 refreshData 统一加载，避免重复请求）
                 waitForChartJS(() => {
                     loadEquityCurve(currentId);
                 });
-                loadStrategyReport(currentId);
                 
                 accountsInitialized = true;
                 return;
@@ -957,9 +956,16 @@
                 sseEventSource.addEventListener('accounts_updated', () => {
                     updateAccounts().then(() => {
                         loadEquityCurveAll();
-                        const activeId = getActiveAccountId();
-                        if (activeId) loadStrategyReport(activeId);
                     });
+                });
+                sseEventSource.addEventListener('report_updated', (e) => {
+                    try {
+                        const data = e.data ? JSON.parse(e.data) : {};
+                        const accountId = data.account_id;
+                        if (accountId) loadStrategyReport(accountId);
+                    } catch (err) {
+                        console.warn('report_updated parse:', err);
+                    }
                 });
                 sseEventSource.onerror = () => {
                     if (sseEventSource) {
@@ -1001,8 +1007,8 @@
                 if (autoRefreshInterval) clearInterval(autoRefreshInterval);
                 startSSE();
                 startEquityFixedInterval();
-                autoRefreshInterval = setInterval(refreshNonAccountData, 5000);
-                refreshData();
+                autoRefreshInterval = setInterval(refreshNonAccountData, 10000);
+                // 不在此处调用 refreshData()，避免与 DOMContentLoaded 的 refreshData 重复
             } else {
                 if (autoRefreshInterval) {
                     clearInterval(autoRefreshInterval);
@@ -1011,16 +1017,6 @@
                 stopSSE();
                 stopEquityFixedInterval();
             }
-        }
-        
-        function startStrategyReportPoll() {
-            if (strategyReportPollTimer) clearInterval(strategyReportPollTimer);
-            strategyReportPollTimer = setInterval(() => {
-                const activeTab = document.querySelector('.account-tab.active');
-                if (activeTab && activeTab.dataset.accountId) {
-                    loadStrategyReport(activeTab.dataset.accountId);
-                }
-            }, 60000);
         }
         
         const equityCharts = {};
@@ -1236,12 +1232,15 @@
         }
         
         async function loadStrategyReport(accountId) {
+            const myLoadId = ++strategyReportLoadId;
+            const container = document.getElementById(`${accountId}-report-content`);
+            if (!container) return;
             try {
-                const container = document.getElementById(`${accountId}-report-content`);
-                if (!container) return;
                 container.innerHTML = '<div style="padding:12px;color:#9e9e9e;">加载中...</div>';
                 container.dataset.loaded = 'false';
-                const report = await fetchAPIWithTimeout(`/api/strategy-report/${accountId}`, 12000);
+                // 策略报告接口较慢，移动端网络延迟更高，使用 30 秒超时
+                const report = await fetchAPIWithTimeout(`/api/strategy-report/${accountId}`, 30000);
+                if (myLoadId !== strategyReportLoadId) return; // 已有更新的请求，不覆盖
                 if (!report || Object.keys(report).length === 0) {
                     container.innerHTML = 
                         '<div style="padding: 20px; text-align: center; color: #9e9e9e;">暂无策略报告数据</div>';
@@ -1323,7 +1322,7 @@
                 
             } catch (error) {
                 console.error(`Error loading strategy report for ${accountId}:`, error);
-                const container = document.getElementById(`${accountId}-report-content`);
+                if (myLoadId !== strategyReportLoadId) return; // 已有更新的请求，不覆盖
                 if (container) {
                     const msg = (error && error.message === '加载超时') ? '加载超时，请点击「手动刷新」重试' : '加载策略报告失败';
                     container.innerHTML = 

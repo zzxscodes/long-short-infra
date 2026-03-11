@@ -131,6 +131,14 @@ class StrategyReportGenerator:
             logger.debug(
                 f"Saved {len(data['records'])} position records for {account_id}"
             )
+            # 写入信号文件，通知监控进程推送 SSE，前端立即刷新策略报告
+            try:
+                signals_dir = Path(config.get("data.signals_directory", "data/signals"))
+                signals_dir.mkdir(parents=True, exist_ok=True)
+                signal_file = signals_dir / f"report_updated_{account_id}"
+                signal_file.write_text(data["last_updated"], encoding="utf-8")
+            except Exception as e:
+                logger.debug(f"Failed to write report_updated signal: {e}")
         except Exception as e:
             logger.error(
                 f"Failed to save position history for {account_id}: {e}", exc_info=True
