@@ -14,6 +14,8 @@
 - **Universe管理**: 每天23:55（北京时间）自动更新可交易资产列表，支持版本管理（v1, v2等）
 - **溢价指数K线**: 自动采集和存储溢价指数K线数据
 - **历史资金费率**: 自动采集和存储历史资金费率数据
+- **每日官方K线对比**: 定时对比 Binance 官方 5m K 线与自聚合结果，通过则同步到回测机；不通过则重拉 aggTrade、重聚合后同步
+- **回测数据同步**: 定时任务将 K 线、funding_rates、premium_index 同步至回测服务器（布局与 storage 一致，回测机配置对应目录即可）
 - **防重复触发**: 策略计算防重复触发机制，确保计算完整性
 - **数据完整性检查**: 多周期数据完整性检查，确保策略触发时机准确
 - **无成交K线处理**: 自动生成无成交时段的K线数据
@@ -134,6 +136,16 @@ data:
 **配置优先级**: 环境变量 > 配置文件
 - Testnet: `{ACCOUNT_ID}_TESTNET_API_KEY` / `{ACCOUNT_ID}_TESTNET_API_SECRET`
 - Live: `{ACCOUNT_ID}_API_KEY` / `{ACCOUNT_ID}_API_SECRET`
+
+**回测数据同步**（`data.*`）：
+
+```yaml
+data:
+  backtest_klines_dest: data/backtest_klines
+  backtest_funding_rates_dest: data/backtest_funding_rates
+  backtest_premium_index_dest: data/backtest_premium_index
+  daily_compare_use_data_vision: true  # 使用 data.binance.vision，避免占用 fapi 限流
+```
 
 ### 启动/停止
 
@@ -373,6 +385,63 @@ python scripts/temp_validate_data_layer_vs_binance.py \
 - Binance 可能返回 `429`，可降低 `--concurrency` 或缩小 `--symbols` 重试；
 - 脚本退出码为 0 表示本轮样本全部通过。
 
+## 每日官方K线对比与回测数据同步
+
+### 定时任务说明
+
+脚本 `scripts/daily_official_5m_compare.py` 用于：
+
+1. **对比** Binance 官方 5m K 线与本地自聚合 K 线（默认使用 `data.binance.vision`，避免占用 fapi 限流）
+2. **K 线同步**：对比通过则同步当日 K 线至回测机；不通过则重拉 aggTrade、重聚合、覆盖本地后再同步
+3. **funding_rates / premium_index 同步**：不做对比，直接将当日数据同步至回测机（布局与 K 线一致）
+
+对比的是「过去某一天」的历史数据，默认取昨天（UTC）。建议 cron 时间：**UTC 10:30**（`30 10 * * *`，配合 `CRON_TZ=UTC`），此时 data.binance.vision 当日文件通常已可用。
+
+### 安装定时任务
+
+**Linux/macOS**：
+
+```bash
+./scripts/setup_daily_compare_cron.sh
+# 或使用 Python 安装器（支持 --time HH:MM、--remove）
+python scripts/setup_daily_compare_scheduler.py --time 10:30
+```
+
+**Windows**：
+
+```cmd
+scripts\setup_daily_compare.bat
+rem 或使用 Python 安装器
+python scripts/setup_daily_compare_scheduler.py --time 10:30
+```
+
+### 配置项（config/default.yaml）
+
+```yaml
+data:
+  backtest_klines_dest: data/backtest_klines        # K 线同步目标（本地路径或 rsync user@host:/path）
+  backtest_funding_rates_dest: data/backtest_funding_rates   # funding_rates 同步目标
+  backtest_premium_index_dest: data/backtest_premium_index   # premium_index 同步目标
+  daily_compare_use_data_vision: true               # 使用 data.binance.vision（推荐，不占 fapi 限流）
+```
+
+回测机需将 `data.klines_directory`、`data.funding_rates_directory`、`data.premium_index_directory` 分别指向上述同步目标根路径，目录布局为 `{dest}/{SYMBOL}/{YYYY-MM-DD}.parquet`。
+
+### 脚本参数示例
+
+```bash
+# 仅对比（不同步）
+python scripts/daily_official_5m_compare.py --compare-only --day 2026-03-10
+
+# 指定交易对
+python scripts/daily_official_5m_compare.py --symbols BTCUSDT,ETHUSDT
+
+# 指定同步目标
+python scripts/daily_official_5m_compare.py --backtest-dest user@host:/data/backtest_klines
+```
+
+Symbol 来源：不传 `--symbols` 时从 universe（`universe.json` 或 `data/universe/{date}/v1/universe.csv`）加载
+
 ## 数据存储结构
 
 ```
@@ -402,44 +471,56 @@ data/
     └── {account_id}_strategy_report_latest.json
 ```
 
+**回测数据同步目标**（由定时任务 `daily_official_5m_compare.py` 写入）：
+
+| 配置项 | 默认路径 | 说明 |
+|--------|----------|------|
+| `data.backtest_klines_dest` | `data/backtest_klines` | K 线同步目标（对比通过后） |
+| `data.backtest_funding_rates_dest` | `data/backtest_funding_rates` | 资金费率同步目标 |
+| `data.backtest_premium_index_dest` | `data/backtest_premium_index` | 溢价指数同步目标 |
+
+布局均为 `{dest}/{SYMBOL}/{YYYY-MM-DD}.parquet`，支持本地路径或 rsync 目标（如 `user@host:/path`）
+
 ## 项目结构
 
 ```
 long-short-infra/
 ├── src/
 │   ├── api/                  # 策略API：统一封装数据层、系统层、执行层
-│   │   └── strategy_api.py   # StrategyAPI（推荐策略开发使用）
+│   │   └── strategy_api.py
 │   ├── data/                 # 数据层：采集、聚合、存储
 │   │   ├── collector.py      # 归集逐笔成交采集器（@aggTrade）
-│   │   ├── kline_aggregator.py  # K线聚合器（多周期支持）
-│   │   ├── premium_index_collector.py    # 溢价指数K线采集器
-│   │   ├── universe_manager.py  # Universe管理器（支持版本）
-│   │   ├── storage.py         # 数据存储管理
-│   │   └── api.py            # 数据查询API
-│   ├── strategy/             # 策略层：计算、持仓生成
-│   │   ├── alpha.py         # Alpha引擎：并发执行calculators
-│   │   ├── calculator.py     # Calculator基类和AlphaDataView（提供数据访问接口）
-│   │   ├── calculators/      # Calculators（因子）目录
-│   │   │   ├── __init__.py  # 自动加载机制
-│   │   │   ├── template.py  # 开发模板
-│   │   │   └── *.py         # 各研究员的因子文件
-│   │   └── position_generator.py  # 持仓生成器
-│   ├── execution/            # 执行层：订单管理、持仓管理
-│   │   ├── order_manager.py  # 订单管理器（Market/TWAP/VWAP）
-│   │   ├── position_manager.py  # 持仓管理器
-│   │   └── binance_client.py  # Binance API客户端
-│   ├── monitoring/           # 监控层：指标、告警
+│   │   ├── kline_aggregator.py
+│   │   ├── multi_interval_aggregator.py
+│   │   ├── funding_rate_collector.py
+│   │   ├── funding_market_collector.py  # WebSocket 资金费率/标记价格
+│   │   ├── premium_index_collector.py
+│   │   ├── daily_official_compare.py   # 官方5m对比与回测数据同步
+│   │   ├── universe_manager.py
+│   │   ├── storage.py
+│   │   └── api.py
+│   ├── strategy/             # 策略层：Alpha引擎、Calculators、持仓生成
+│   ├── execution/            # 执行层：订单管理、Binance 客户端
+│   ├── monitoring/           # 监控层：指标、告警、策略报告、Web API
 │   ├── common/               # 公共模块：配置、日志、IPC、网络工具
 │   ├── processes/            # 进程入口
-│   └── system_api.py         # 系统API
-├── web/                      # Web监控界面
+│   └── backtest/             # 回测模块（独立于实盘流程）
+├── scripts/
+│   ├── daily_official_5m_compare.py    # 每日官方K线对比与回测数据同步
+│   ├── setup_daily_compare_scheduler.py # 定时任务安装（cron/schtasks）
+│   ├── setup_daily_compare_cron.sh
+│   ├── setup_daily_compare.bat
+│   ├── daily_compare_launcher.bat
+│   ├── temp_validate_data_layer_vs_binance.py  # 聚合准确性校验
+│   └── data_layer_memory_stress.py     # 数据层内存压力测试
+├── web/
 │   └── monitor.html          # 监控面板前端
 ├── config/
-│   └── default.yaml          # 主配置文件
+│   └── default.yaml
 ├── data/                     # 数据存储
-├── logs/                     # 日志目录
-├── start_all.py              # 启动脚本
-└── stop_all.py               # 停止脚本
+├── logs/
+├── start_all.py
+└── stop_all.py
 ```
 
 ## 注意事项
@@ -456,11 +537,13 @@ long-short-infra/
 10. **Web监控**: 访问 `http://localhost:8080` 查看实时监控界面，支持多账户执行进程状态监控
 11. **Calculators并发**: 默认使用线程池并发执行所有calculators，可通过配置调整为进程池或串行模式
 12. **因子开发**: 在`src/strategy/calculators/`目录下创建因子文件，系统会自动发现并加载
+13. **回测数据同步**: 定时任务 `scripts/daily_official_5m_compare.py` 会将 K 线、funding_rates、premium_index 同步至回测服务器；回测机须将 `data.klines_directory`、`data.funding_rates_directory`、`data.premium_index_directory` 指向对应同步目标根路径
 
 ## 版本更新
 
 ### 最新功能
 
+- ✅ **每日官方K线对比与回测数据同步**: 定时对比 Binance 官方 5m K 线与自聚合结果，同步 K 线、funding_rates、premium_index 至回测机；默认使用 data.binance.vision 避免 fapi 限流
 - ✅ **Web监控界面**: 提供实时Web监控面板，支持进程状态、账户信息、系统监控
 - ✅ **多账户执行进程监控**: 支持监控多个账户的执行进程状态
 - ✅ **归集逐笔数据**: 使用@aggTrade替代@trade，减少数据量，提高处理效率

@@ -34,6 +34,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -53,9 +54,11 @@ env/
 nosetests.xml
 coverage.xml
 *.cover
-*.log
 htmlcov/
 .hypothesis/
+# Test/script output (when not under logs/)
+*.log
+test_output/
 
 # Data files (runtime data, but keep directory structure)
 data/klines/**/*.parquet
@@ -63,6 +66,7 @@ data/trades/**/*.parquet
 data/funding_rates/**/*.parquet
 data/premium_index/**/*.parquet
 data/positions/*.json
+data/position_history/*.json
 data/universe/**/*.csv
 data/signals/*.json
 data/equity_curve/**/*.json
@@ -70,6 +74,16 @@ data/strategy_reports/**/*.json
 data/api_performance/**/*.json
 data/performance/**/*.json
 data/system.pids
+# Daily official compare output
+data/compare/
+# Backtest sync destinations (local copies of klines/funding_rates/premium_index)
+data/backtest_klines/**/*.parquet
+data/backtest_funding_rates/**/*.parquet
+data/backtest_premium_index/**/*.parquet
+# Corrupted parquet quarantine (storage.py)
+data/corrupted_parquet/
+*.corrupted
+*.corrupted.parquet
 # Keep .empty files to preserve directory structure
 !data/**/.empty
 

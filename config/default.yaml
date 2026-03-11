@@ -39,6 +39,12 @@ data:
   equity_curve_directory: data/equity_curve  # 净值曲线数据目录
   position_history_directory: data/position_history  # 持仓历史数据目录
   strategy_reports_directory: data/strategy_reports  # 策略报告数据目录
+
+  backtest_klines_dest: data/backtest_klines  # 每日对比通过后同步 K 线的目标（本地路径或 rsync user@host:/path）。回测机须将 data.klines_directory 设为该路径根，以匹配 {dest}/{SYMBOL}/{YYYY-MM-DD}.parquet 布局
+  backtest_funding_rates_dest: data/backtest_funding_rates  # 定时任务同步 funding_rates 目标（与 K 线同理，不做对比）。回测机须将 data.funding_rates_directory 指向此路径根
+  backtest_premium_index_dest: data/backtest_premium_index  # 定时任务同步 premium_index 目标（与 K 线同理，不做对比）。回测机须将 data.premium_index_directory 指向此路径根
+  # 每日官方对比：使用 data.binance.vision 下载 kline/aggTrade，避免占用 fapi 限流影响实盘，同时vision跨天UTC+0 10：30完全更新
+  daily_compare_use_data_vision: true
   
   # 数据层进程配置
   save_interval: 60  # 定期保存间隔（秒）

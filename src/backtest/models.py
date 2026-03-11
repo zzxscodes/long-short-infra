@@ -104,7 +104,7 @@ class HistoricalKline:
             low=safe_float(row.get('low', 0)),
             close=safe_float(row.get('close', 0)),
             volume=safe_float(row.get('volume', 0)),
-            quote_asset_volume=safe_float(row.get('quote_asset_volume', 0))
+            quote_asset_volume=safe_float(row.get('quote_asset_volume') or row.get('quote_volume', 0))
         )
 
 
