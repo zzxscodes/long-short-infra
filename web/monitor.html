@@ -378,9 +378,33 @@
         let accountsInitialized = false;
         // 记录每个账号上次刷新 Equity Curve 的时间戳（ms）
         const lastEquityRefresh = {};
-        // 策略报告轮询定时器
+        // 策略报告轮询定时器（后备，SSE 驱动后可不依赖）
+        // 策略报告不参与定时轮询，仅在「数据更新」(SSE)、手动刷新、切换账户时刷新
         let strategyReportPollTimer = null;
-        const STRATEGY_REPORT_POLL_MS = 60000; // 60 秒
+        // 无账户更新时，Equity Curve 固定间隔刷新（秒）
+        const EQUITY_FIXED_INTERVAL_MS = 15000; // 15 秒
+        let equityFixedIntervalTimer = null;
+        // SSE 连接（账户数据更新事件驱动）
+        let sseEventSource = null;
+        // 当前选中的 accountId（用于 SSE 时刷新 equity/report）
+        function getActiveAccountId() {
+            const tab = document.querySelector('.account-tab.active');
+            return tab ? tab.dataset.accountId : null;
+        }
+        /** 当前页面上所有账户 ID（多账户并行刷新用） */
+        function getAllAccountIds() {
+            return Array.from(document.querySelectorAll('.account-tab'))
+                .map(t => t.dataset.accountId)
+                .filter(Boolean);
+        }
+        /** 并行刷新所有账户的 Equity Curve */
+        function loadEquityCurveAll() {
+            const ids = getAllAccountIds();
+            if (ids.length === 0) return;
+            waitForChartJS(() => {
+                ids.forEach(id => loadEquityCurve(id));
+            });
+        }
         
         // 确保 Chart.js 加载完成后再执行
         function waitForChartJS(callback, maxWait = 10000) {
@@ -414,6 +438,22 @@
             } catch (error) {
                 console.error(`Error fetching ${endpoint}:`, error);
                 return null;
+            }
+        }
+        
+        /** 带超时的 fetch，用于策略报告等可能较慢的接口 */
+        async function fetchAPIWithTimeout(endpoint, timeoutMs) {
+            const controller = new AbortController();
+            const to = setTimeout(() => controller.abort(), timeoutMs || 10000);
+            try {
+                const response = await fetch(`${API_BASE}${endpoint}`, { signal: controller.signal });
+                clearTimeout(to);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return await response.json();
+            } catch (e) {
+                clearTimeout(to);
+                if (e.name === 'AbortError') throw new Error('加载超时');
+                throw e;
             }
         }
         
@@ -768,7 +808,6 @@
                     loadEquityCurve(currentId);
                 });
                 loadStrategyReport(currentId);
-                startStrategyReportPoll();
                 
                 accountsInitialized = true;
                 return;
@@ -850,18 +889,7 @@
                 content.classList.toggle('active', accountId === currentId);
             });
 
-            // ---- 按节流间隔刷新当前账号的 Equity Curve（不重建外框架） ----
-            const now = Date.now();
-            const equityIntervalMs = 15000; // 15 秒刷新一次
-            if (
-                !lastEquityRefresh[currentId] ||
-                now - lastEquityRefresh[currentId] >= equityIntervalMs
-            ) {
-                waitForChartJS(() => {
-                    loadEquityCurve(currentId);
-                });
-                lastEquityRefresh[currentId] = now;
-            }
+            // 账户指标已由 SSE 或 5s 轮询更新；Equity Curve 由 SSE 回调立即刷新或由固定 15s 定时器刷新，此处不再按节流刷新
         }
         
         function switchAccountTab(accountId) {
@@ -904,21 +932,84 @@
                 updatePerformance(),
                 updateAccounts()
             ]);
+            const activeId = getActiveAccountId();
+            if (activeId) {
+                loadStrategyReport(activeId);
+            }
+            loadEquityCurveAll();
+        }
+        
+        /** 仅刷新非账户数据（进程、系统、性能）；账户数据由 SSE 推送后刷新 */
+        async function refreshNonAccountData() {
+            await Promise.all([
+                updateSystemStatus(),
+                updateProcesses(),
+                updateSystemInfo(),
+                updatePerformance()
+            ]);
+        }
+        
+        function startSSE() {
+            if (sseEventSource) return;
+            const url = API_BASE + '/api/sse';
+            try {
+                sseEventSource = new EventSource(url);
+                sseEventSource.addEventListener('accounts_updated', () => {
+                    updateAccounts().then(() => {
+                        loadEquityCurveAll();
+                        const activeId = getActiveAccountId();
+                        if (activeId) loadStrategyReport(activeId);
+                    });
+                });
+                sseEventSource.onerror = () => {
+                    if (sseEventSource) {
+                        sseEventSource.close();
+                        sseEventSource = null;
+                        setTimeout(startSSE, 5000);
+                    }
+                };
+            } catch (e) {
+                console.warn('SSE connect failed, fallback to polling:', e);
+                sseEventSource = null;
+            }
+        }
+        
+        function stopSSE() {
+            if (sseEventSource) {
+                sseEventSource.close();
+                sseEventSource = null;
+            }
+        }
+        
+        function startEquityFixedInterval() {
+            if (equityFixedIntervalTimer) return;
+            equityFixedIntervalTimer = setInterval(() => {
+                loadEquityCurveAll();
+            }, EQUITY_FIXED_INTERVAL_MS);
+        }
+        
+        function stopEquityFixedInterval() {
+            if (equityFixedIntervalTimer) {
+                clearInterval(equityFixedIntervalTimer);
+                equityFixedIntervalTimer = null;
+            }
         }
         
         function toggleAutoRefresh() {
             const checkbox = document.getElementById('autoRefresh');
             if (checkbox.checked) {
-                if (autoRefreshInterval) {
-                    clearInterval(autoRefreshInterval);
-                }
-                autoRefreshInterval = setInterval(refreshData, 5000);
+                if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+                startSSE();
+                startEquityFixedInterval();
+                autoRefreshInterval = setInterval(refreshNonAccountData, 5000);
                 refreshData();
             } else {
                 if (autoRefreshInterval) {
                     clearInterval(autoRefreshInterval);
                     autoRefreshInterval = null;
                 }
+                stopSSE();
+                stopEquityFixedInterval();
             }
         }
         
@@ -929,7 +1020,7 @@
                 if (activeTab && activeTab.dataset.accountId) {
                     loadStrategyReport(activeTab.dataset.accountId);
                 }
-            }, STRATEGY_REPORT_POLL_MS);
+            }, 60000);
         }
         
         const equityCharts = {};
@@ -1148,7 +1239,9 @@
             try {
                 const container = document.getElementById(`${accountId}-report-content`);
                 if (!container) return;
-                const report = await fetchAPI(`/api/strategy-report/${accountId}`);
+                container.innerHTML = '<div style="padding:12px;color:#9e9e9e;">加载中...</div>';
+                container.dataset.loaded = 'false';
+                const report = await fetchAPIWithTimeout(`/api/strategy-report/${accountId}`, 12000);
                 if (!report || Object.keys(report).length === 0) {
                     container.innerHTML = 
                         '<div style="padding: 20px; text-align: center; color: #9e9e9e;">暂无策略报告数据</div>';
@@ -1232,8 +1325,9 @@
                 console.error(`Error loading strategy report for ${accountId}:`, error);
                 const container = document.getElementById(`${accountId}-report-content`);
                 if (container) {
+                    const msg = (error && error.message === '加载超时') ? '加载超时，请点击「手动刷新」重试' : '加载策略报告失败';
                     container.innerHTML = 
-                        '<div style="padding: 20px; text-align: center; color: #ff6b6b;">加载策略报告失败</div>';
+                        '<div style="padding: 20px; text-align: center; color: #ff6b6b;">' + msg + '</div>';
                     container.dataset.loaded = 'true';
                 }
             }

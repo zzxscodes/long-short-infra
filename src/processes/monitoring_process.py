@@ -31,7 +31,7 @@ logger = get_logger('monitoring_process')
 # FastAPI imports (optional, graceful fallback if not installed)
 try:
     from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -89,6 +89,8 @@ class MonitoringProcess:
         self._mark_price_cache: Optional[MarkPriceCache] = None
         self._account_streams: Dict[str, AccountStream] = {}
         self._ws_tasks: List[asyncio.Task] = []
+        # SSE：前端订阅“账户数据已更新”，用于事件驱动刷新（不轮询）
+        self._sse_queues: List[asyncio.Queue] = []
         
         # 状态
         self.running = False
@@ -442,6 +444,13 @@ class MonitoringProcess:
                     logger.warning(f"Account {aid} raised exception: {result}")
                 elif isinstance(result, dict) and 'account_id' in result:
                     self.monitoring_data[result['account_id']] = result
+            
+            # 通知所有 SSE 订阅者：账户数据已更新，前端可立即拉取 /api/accounts 并刷新 equity curve
+            for q in list(self._sse_queues):
+                try:
+                    q.put_nowait("accounts_updated")
+                except asyncio.QueueFull:
+                    pass
     
     def _print_monitoring_summary(self):
         """打印监控摘要"""
@@ -639,6 +648,37 @@ class MonitoringProcess:
                 "processes": ProcessManager.get_process_status(),
                 "system_info": ProcessManager.get_system_info(),
             })
+        
+        @self.app.get("/api/sse")
+        async def sse_accounts_updated():
+            """SSE：后台账户数据更新时推送，前端据此立即刷新账户指标与 equity curve，无需轮询"""
+            queue: asyncio.Queue = asyncio.Queue()
+            self._sse_queues.append(queue)
+
+            async def event_stream():
+                try:
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(queue.get(), timeout=30.0)
+                            if msg == "accounts_updated":
+                                yield f"event: accounts_updated\ndata: {{}}\n\n"
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                        except asyncio.CancelledError:
+                            break
+                finally:
+                    if queue in self._sse_queues:
+                        self._sse_queues.remove(queue)
+
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         
         @self.app.get("/api/accounts")
         async def get_accounts():
