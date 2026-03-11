@@ -1238,8 +1238,8 @@
             try {
                 container.innerHTML = '<div style="padding:12px;color:#9e9e9e;">加载中...</div>';
                 container.dataset.loaded = 'false';
-                // 策略报告接口较慢，移动端网络延迟更高，使用 30 秒超时
-                const report = await fetchAPIWithTimeout(`/api/strategy-report/${accountId}`, 30000);
+                // 策略报告接口较慢，弱网/冷启动时可能较久，使用 45 秒超时
+                const report = await fetchAPIWithTimeout(`/api/strategy-report/${accountId}`, 45000);
                 if (myLoadId !== strategyReportLoadId) return; // 已有更新的请求，不覆盖
                 if (!report || Object.keys(report).length === 0) {
                     container.innerHTML = 

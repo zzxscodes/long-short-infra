@@ -91,6 +91,10 @@ class MonitoringProcess:
         self._ws_tasks: List[asyncio.Task] = []
         # SSE：前端订阅“账户数据已更新”，用于事件驱动刷新（不轮询）
         self._sse_queues: List[asyncio.Queue] = []
+
+        # 策略报告缓存：按 report_data_updated_at 命中直接返回，避免重复重算导致加载慢
+        # 结构: {account_id: {"report_data_updated_at": str|None, "report": dict}}
+        self._strategy_report_cache: Dict[str, Dict] = {}
         
         # 状态
         self.running = False
@@ -791,6 +795,15 @@ class MonitoringProcess:
                 from datetime import timedelta
                 
                 report_generator = get_strategy_report_generator()
+                # 先取底层数据更新时间：如果没变化，直接返回缓存（显著降低重复刷新开销）
+                report_data_updated_at = report_generator.get_report_data_updated_at(account_id)
+                cached = self._strategy_report_cache.get(account_id)
+                if (
+                    cached
+                    and cached.get("report_data_updated_at") == report_data_updated_at
+                    and isinstance(cached.get("report"), dict)
+                ):
+                    return JSONResponse(cached["report"])
                 end_date = datetime.now(timezone.utc)
                 
                 # 从Equity Curve获取程序执行期间的开始时间（程序启动后的第一次快照时间）
@@ -836,11 +849,15 @@ class MonitoringProcess:
                 
                 report = await report_generator.generate_report(account_id, start_date, end_date)
                 # 报告底层数据最后更新时间（策略执行写持仓历史时更新），供前端判断是否更新时间戳
-                report_data_updated_at = report_generator.get_report_data_updated_at(account_id)
                 if report_data_updated_at:
                     report["report_data_updated_at"] = report_data_updated_at
                 from ..common.utils import sanitize_for_json
                 cleaned_report = sanitize_for_json(report)
+                # 写入缓存（命中条件是 report_data_updated_at 不变）
+                self._strategy_report_cache[account_id] = {
+                    "report_data_updated_at": report_data_updated_at,
+                    "report": cleaned_report,
+                }
                 return JSONResponse(cleaned_report)
             except Exception as e:
                 logger.error(f"Failed to get strategy report: {e}", exc_info=True)
