@@ -40,11 +40,19 @@ data:
   position_history_directory: data/position_history  # 持仓历史数据目录
   strategy_reports_directory: data/strategy_reports  # 策略报告数据目录
 
-  backtest_klines_dest: data/backtest_klines  # 每日对比通过后同步 K 线的目标（本地路径或 rsync user@host:/path）。回测机须将 data.klines_directory 设为该路径根，以匹配 {dest}/{SYMBOL}/{YYYY-MM-DD}.parquet 布局
-  backtest_funding_rates_dest: data/backtest_funding_rates  # 定时任务同步 funding_rates 目标（与 K 线同理，不做对比）。回测机须将 data.funding_rates_directory 指向此路径根
-  backtest_premium_index_dest: data/backtest_premium_index  # 定时任务同步 premium_index 目标（与 K 线同理，不做对比）。回测机须将 data.premium_index_directory 指向此路径根
-  # 每日官方对比：使用 data.binance.vision 下载 kline/aggTrade，避免占用 fapi 限流影响实盘，同时vision跨天UTC+0 10：30完全更新
-  daily_compare_use_data_vision: true
+  # ===== 回测机主动拉取模式配置 =====
+  # 回测机（Windows 10.105.104.107）主动从实盘机器拉取数据，本地对比，不一致则自动修复
+  # 使用脚本: scripts/backtest_pull_compare.py
+  # 定时任务: scripts/setup_backtest_compare.bat 或 setup_backtest_compare_scheduler.py
+  
+  # 实盘机器连接信息（回测机需要 SSH 免密登录）
+  backtest_pull_live_host: "10.105.104.91"  # 实盘机器 IP/主机名
+  backtest_pull_live_user: "ubuntu"  # 实盘机器 SSH 用户名
+  
+  # 实盘机器上的数据目录路径（Linux 路径）
+  backtest_pull_live_klines_dir: "/data/long-short-infra/data/klines"
+  backtest_pull_live_funding_rates_dir: "/data/long-short-infra/data/funding_rates"
+  backtest_pull_live_premium_index_dir: "/data/long-short-infra/data/premium_index"
   
   # 数据层进程配置
   save_interval: 60  # 定期保存间隔（秒）
