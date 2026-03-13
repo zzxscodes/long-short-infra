@@ -15,7 +15,7 @@
 - **溢价指数K线**: 自动采集和存储溢价指数K线数据
 - **历史资金费率**: 自动采集和存储历史资金费率数据
 - **每日官方K线对比**: 定时对比 Binance 官方 5m K 线与自聚合结果，通过则同步到回测机；不通过则重拉 aggTrade、重聚合后同步
-- **回测数据同步**: 定时任务将 K 线、funding_rates、premium_index 同步至回测服务器（布局与 storage 一致，回测机配置对应目录即可）
+- **回测数据同步**: 支持两种模式：(1) 实盘机主动推送；(2) **回测机主动拉取**（推荐），从实盘机器拉取数据、对比官方、自动修复不一致
 - **防重复触发**: 策略计算防重复触发机制，确保计算完整性
 - **数据完整性检查**: 多周期数据完整性检查，确保策略触发时机准确
 - **无成交K线处理**: 自动生成无成交时段的K线数据
@@ -387,35 +387,40 @@ python scripts/temp_validate_data_layer_vs_binance.py \
 
 ## 每日官方K线对比与回测数据同步
 
-### 定时任务说明
+系统支持两种数据同步模式，均使用 `data.binance.vision` 官方数据进行对比校验：
 
-脚本 `scripts/daily_official_5m_compare.py` 用于：
+| 模式 | 运行环境 | 说明 |
+|------|----------|------|
+| **实盘机推送** | 实盘机 | 实盘机主动对比、同步数据至回测机 |
+| **回测机拉取**（推荐） | 回测机 | 回测机从实盘机拉取数据，本地对比校验，自动修复不一致 |
 
-1. **对比** Binance 官方 5m K 线与本地自聚合 K 线（默认使用 `data.binance.vision`，避免占用 fapi 限流）
+建议 cron 时间：**UTC 10:30**（`30 10 * * *`，配合 `CRON_TZ=UTC`），此时 data.binance.vision 当日文件通常已可用。
+
+---
+
+### 模式一：实盘机推送
+
+脚本 `scripts/daily_official_5m_compare.py` 在**实盘机**上运行：
+
+1. **对比** Binance 官方 5m K 线与本地自聚合 K 线
 2. **K 线同步**：对比通过则同步当日 K 线至回测机；不通过则重拉 aggTrade、重聚合、覆盖本地后再同步
-3. **funding_rates / premium_index 同步**：不做对比，直接将当日数据同步至回测机（布局与 K 线一致）
+3. **funding_rates / premium_index 同步**：不做对比，直接将当日数据同步至回测机
 
-对比的是「过去某一天」的历史数据，默认取昨天（UTC）。建议 cron 时间：**UTC 10:30**（`30 10 * * *`，配合 `CRON_TZ=UTC`），此时 data.binance.vision 当日文件通常已可用。
-
-### 安装定时任务
-
-**Linux/macOS**：
+**安装定时任务**：
 
 ```bash
+# Linux/macOS
 ./scripts/setup_daily_compare_cron.sh
-# 或使用 Python 安装器（支持 --time HH:MM、--remove）
+# 或
 python scripts/setup_daily_compare_scheduler.py --time 10:30
-```
 
-**Windows**：
-
-```cmd
+# Windows
 scripts\setup_daily_compare.bat
-rem 或使用 Python 安装器
+# 或
 python scripts/setup_daily_compare_scheduler.py --time 10:30
 ```
 
-### 配置项（config/default.yaml）
+**配置项（config/default.yaml）**：
 
 ```yaml
 data:
@@ -425,9 +430,7 @@ data:
   daily_compare_use_data_vision: true               # 使用 data.binance.vision（推荐，不占 fapi 限流）
 ```
 
-回测机需将 `data.klines_directory`、`data.funding_rates_directory`、`data.premium_index_directory` 分别指向上述同步目标根路径，目录布局为 `{dest}/{SYMBOL}/{YYYY-MM-DD}.parquet`。
-
-### 脚本参数示例
+**脚本参数示例**：
 
 ```bash
 # 仅对比（不同步）
@@ -440,7 +443,64 @@ python scripts/daily_official_5m_compare.py --symbols BTCUSDT,ETHUSDT
 python scripts/daily_official_5m_compare.py --backtest-dest user@host:/data/backtest_klines
 ```
 
-Symbol 来源：不传 `--symbols` 时从 universe（`universe.json` 或 `data/universe/{date}/v1/universe.csv`）加载
+---
+
+### 模式二：回测机拉取（推荐）
+
+脚本 `scripts/backtest_pull_compare.py` 在**回测机**上运行：
+
+1. **拉取数据**：通过 SSH/SCP 从实盘机器拉取当日 klines/funding_rates/premium_index 数据
+2. **对比校验**：下载 Binance 官方 5m K 线（data.binance.vision），与拉取的数据对比
+3. **自动修复**：对比不通过则从 data.binance.vision 下载历史 aggTrade，聚合覆盖本地数据
+
+**前置条件**：
+- 配置 SSH 免密登录到实盘机器（`ssh-keygen` + `ssh-copy-id`）
+- 在 `config/default.yaml` 中配置 `backtest_pull` 相关参数
+
+**安装定时任务**：
+
+```bash
+# Linux/macOS
+python scripts/setup_backtest_compare_scheduler.py --time 10:30
+
+# Windows（默认 18:30 本地时间，对应 UTC+8 的 UTC 10:30）
+scripts\setup_backtest_compare.bat
+# 或
+python scripts/setup_backtest_compare_scheduler.py --time 18:30
+```
+
+**配置项（config/default.yaml）**：
+
+```yaml
+data:
+  # 回测机拉取模式配置
+  backtest_pull_live_host: "192.168.1.100"          # 实盘机器 IP/hostname
+  backtest_pull_live_user: "quant"                  # SSH 用户名
+  backtest_pull_live_klines_dir: "/home/quant/long-short-infra/data/klines"
+  backtest_pull_live_funding_rates_dir: "/home/quant/long-short-infra/data/funding_rates"
+  backtest_pull_live_premium_index_dir: "/home/quant/long-short-infra/data/premium_index"
+```
+
+**脚本参数示例**：
+
+```bash
+# 完整流程（拉取 + 对比 + 修复）
+python scripts/backtest_pull_compare.py --day 2026-03-10
+
+# 仅对比（跳过拉取，使用本地已有数据）
+python scripts/backtest_pull_compare.py --compare-only --day 2026-03-10
+
+# 指定实盘机器参数
+python scripts/backtest_pull_compare.py --live-host 192.168.1.100 --live-user quant \
+  --live-klines-dir /home/quant/data/klines
+```
+
+---
+
+### 通用说明
+
+- Symbol 来源：不传 `--symbols` 时从 universe（`universe.json` 或 `data/universe/{date}/v1/universe.csv`）加载
+- 回测机需将 `data.klines_directory`、`data.funding_rates_directory`、`data.premium_index_directory` 分别指向对应数据目录，布局为 `{dir}/{SYMBOL}/{YYYY-MM-DD}.parquet`
 
 ## 数据存储结构
 
@@ -506,11 +566,16 @@ long-short-infra/
 │   ├── processes/            # 进程入口
 │   └── backtest/             # 回测模块（独立于实盘流程）
 ├── scripts/
-│   ├── daily_official_5m_compare.py    # 每日官方K线对比与回测数据同步
-│   ├── setup_daily_compare_scheduler.py # 定时任务安装（cron/schtasks）
+│   ├── daily_official_5m_compare.py    # 实盘机：每日官方K线对比与回测数据同步
+│   ├── setup_daily_compare_scheduler.py # 实盘机：定时任务安装（cron/schtasks）
 │   ├── setup_daily_compare_cron.sh
 │   ├── setup_daily_compare.bat
 │   ├── daily_compare_launcher.bat
+│   ├── backtest_pull_compare.py        # 回测机：主动拉取数据并对比修复
+│   ├── setup_backtest_compare_scheduler.py # 回测机：定时任务安装（cron/schtasks）
+│   ├── setup_backtest_compare.bat
+│   ├── backtest_pull_launcher.sh
+│   ├── backtest_pull_launcher.bat
 │   ├── temp_validate_data_layer_vs_binance.py  # 聚合准确性校验
 │   └── data_layer_memory_stress.py     # 数据层内存压力测试
 ├── web/
@@ -537,13 +602,13 @@ long-short-infra/
 10. **Web监控**: 访问 `http://localhost:8080` 查看实时监控界面，支持多账户执行进程状态监控
 11. **Calculators并发**: 默认使用线程池并发执行所有calculators，可通过配置调整为进程池或串行模式
 12. **因子开发**: 在`src/strategy/calculators/`目录下创建因子文件，系统会自动发现并加载
-13. **回测数据同步**: 定时任务 `scripts/daily_official_5m_compare.py` 会将 K 线、funding_rates、premium_index 同步至回测服务器；回测机须将 `data.klines_directory`、`data.funding_rates_directory`、`data.premium_index_directory` 指向对应同步目标根路径
+13. **回测数据同步**: 支持两种模式：(1) 实盘机推送（`scripts/daily_official_5m_compare.py`）；(2) 回测机拉取（`scripts/backtest_pull_compare.py`，推荐）。回测机须将 `data.klines_directory`、`data.funding_rates_directory`、`data.premium_index_directory` 指向对应数据目录
 
 ## 版本更新
 
 ### 最新功能
 
-- ✅ **每日官方K线对比与回测数据同步**: 定时对比 Binance 官方 5m K 线与自聚合结果，同步 K 线、funding_rates、premium_index 至回测机；默认使用 data.binance.vision 避免 fapi 限流
+- ✅ **每日官方K线对比与回测数据同步**: 支持两种模式：实盘机推送（`daily_official_5m_compare.py`）或回测机拉取（`backtest_pull_compare.py`，推荐），均使用 data.binance.vision 对比校验
 - ✅ **Web监控界面**: 提供实时Web监控面板，支持进程状态、账户信息、系统监控
 - ✅ **多账户执行进程监控**: 支持监控多个账户的执行进程状态
 - ✅ **归集逐笔数据**: 使用@aggTrade替代@trade，减少数据量，提高处理效率
