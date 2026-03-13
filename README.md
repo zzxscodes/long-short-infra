@@ -479,7 +479,10 @@ data:
   backtest_pull_live_klines_dir: "/home/quant/long-short-infra/data/klines"
   backtest_pull_live_funding_rates_dir: "/home/quant/long-short-infra/data/funding_rates"
   backtest_pull_live_premium_index_dir: "/home/quant/long-short-infra/data/premium_index"
+  backtest_pull_live_universe_dir: "/home/quant/long-short-infra/data/universe"  # Universe 目录
 ```
+
+**自动拉取 Universe**：如果本地没有 universe 文件，脚本会自动从实盘机器拉取。
 
 **脚本参数示例**：
 

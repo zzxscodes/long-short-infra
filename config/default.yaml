@@ -46,13 +46,14 @@ data:
   # 定时任务: scripts/setup_backtest_compare.bat 或 setup_backtest_compare_scheduler.py
   
   # 实盘机器连接信息（回测机需要 SSH 免密登录）
-  backtest_pull_live_host: "10.105.104.91"  # 实盘机器 IP/主机名
+  backtest_pull_live_host: "3.113.21.169"  # 实盘机器 IP/主机名
   backtest_pull_live_user: "ubuntu"  # 实盘机器 SSH 用户名
   
   # 实盘机器上的数据目录路径（Linux 路径）
   backtest_pull_live_klines_dir: "/data/long-short-infra/data/klines"
   backtest_pull_live_funding_rates_dir: "/data/long-short-infra/data/funding_rates"
   backtest_pull_live_premium_index_dir: "/data/long-short-infra/data/premium_index"
+  backtest_pull_live_universe_dir: "/data/long-short-infra/data/universe"  # Universe 目录
   
   # 数据层进程配置
   save_interval: 60  # 定期保存间隔（秒）

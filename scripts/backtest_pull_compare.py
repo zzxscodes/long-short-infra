@@ -70,9 +70,11 @@ class PullCompareConfig:
     live_klines_dir: str = ""
     live_funding_rates_dir: str = ""
     live_premium_index_dir: str = ""
+    live_universe_dir: str = ""
     local_klines_dir: str = ""
     local_funding_rates_dir: str = ""
     local_premium_index_dir: str = ""
+    local_universe_dir: str = ""
     timeout_s: float = 60.0
     max_concurrent: int = 5
     retries: int = 3
@@ -151,6 +153,52 @@ def _load_universe_symbols() -> list:
     except Exception:
         pass
     return []
+
+
+def pull_universe_from_live(cfg: PullCompareConfig) -> bool:
+    """
+    从实盘机器拉取 universe 文件到本地
+    尝试拉取: universe.json, universe.csv, 以及最近的日期目录下的 v1/universe.csv
+    返回: True 表示至少拉取了一个文件成功
+    """
+    if not cfg.live_host or not cfg.live_user or not cfg.live_universe_dir:
+        return False
+    
+    local_universe_dir = Path(cfg.local_universe_dir)
+    local_universe_dir.mkdir(parents=True, exist_ok=True)
+    
+    success = False
+    
+    for filename in ["universe.json", "universe.csv"]:
+        remote_path = f"{cfg.live_universe_dir}/{filename}"
+        local_path = local_universe_dir / filename
+        if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_path, str(local_path)):
+            print(f"  Pulled universe file: {filename}")
+            success = True
+    
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+             f"{cfg.live_user}@{cfg.live_host}",
+             f"ls -d {cfg.live_universe_dir}/????-??-?? 2>/dev/null | sort -r | head -5"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            date_dirs = result.stdout.strip().split('\n')
+            for remote_date_dir in date_dirs:
+                date_name = Path(remote_date_dir).name
+                remote_csv = f"{remote_date_dir}/v1/universe.csv"
+                local_date_dir = local_universe_dir / date_name / "v1"
+                local_date_dir.mkdir(parents=True, exist_ok=True)
+                local_csv = local_date_dir / "universe.csv"
+                if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_csv, str(local_csv)):
+                    print(f"  Pulled universe file: {date_name}/v1/universe.csv")
+                    success = True
+                    break
+    except Exception as e:
+        print(f"  Warning: failed to list remote universe date dirs: {e}", file=sys.stderr)
+    
+    return success
 
 
 def _pull_file_from_live(
@@ -609,24 +657,17 @@ async def compare_and_fix(
 async def _main_async(args: argparse.Namespace) -> int:
     day = _parse_day(args.day) if args.day else _default_day_utc()
     
-    if args.symbols:
-        symbols = [format_symbol(s.strip()) for s in args.symbols.split(",") if s.strip()]
-    else:
-        symbols = _load_universe_symbols()
-    
-    if not symbols:
-        print("No symbols provided and universe not found.", file=sys.stderr)
-        return 1
-    
     cfg = PullCompareConfig(
         live_host=args.live_host or str(config.get("data.backtest_pull_live_host", "")),
         live_user=args.live_user or str(config.get("data.backtest_pull_live_user", "")),
         live_klines_dir=args.live_klines_dir or str(config.get("data.backtest_pull_live_klines_dir", "")),
         live_funding_rates_dir=args.live_funding_dir or str(config.get("data.backtest_pull_live_funding_rates_dir", "")),
         live_premium_index_dir=args.live_premium_dir or str(config.get("data.backtest_pull_live_premium_index_dir", "")),
+        live_universe_dir=args.live_universe_dir or str(config.get("data.backtest_pull_live_universe_dir", "")),
         local_klines_dir=args.local_klines_dir or str(config.get("data.klines_directory", "data/klines")),
         local_funding_rates_dir=args.local_funding_dir or str(config.get("data.funding_rates_directory", "data/funding_rates")),
         local_premium_index_dir=args.local_premium_dir or str(config.get("data.premium_index_directory", "data/premium_index")),
+        local_universe_dir=args.local_universe_dir or str(config.get("data.universe_directory", "data/universe")),
         max_concurrent=int(args.max_concurrent),
     )
     
@@ -641,6 +682,20 @@ async def _main_async(args: argparse.Namespace) -> int:
     
     print(f"=== Backtest Pull Compare: {day.isoformat()} ===")
     print(f"Live: {cfg.live_user}@{cfg.live_host}")
+    
+    if args.symbols:
+        symbols = [format_symbol(s.strip()) for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols = _load_universe_symbols()
+        if not symbols and cfg.live_universe_dir:
+            print(f"\n[Step 0] Local universe not found, pulling from live machine...")
+            if pull_universe_from_live(cfg):
+                symbols = _load_universe_symbols()
+    
+    if not symbols:
+        print("No symbols provided and universe not found (both local and remote).", file=sys.stderr)
+        return 1
+    
     print(f"Symbols: {len(symbols)}")
     
     if not args.compare_only:
@@ -681,9 +736,11 @@ def main() -> int:
     parser.add_argument("--live-klines-dir", help="Klines directory path on live machine.")
     parser.add_argument("--live-funding-dir", help="Funding rates directory path on live machine.")
     parser.add_argument("--live-premium-dir", help="Premium index directory path on live machine.")
+    parser.add_argument("--live-universe-dir", help="Universe directory path on live machine.")
     parser.add_argument("--local-klines-dir", help="Local klines directory path.")
     parser.add_argument("--local-funding-dir", help="Local funding rates directory path.")
     parser.add_argument("--local-premium-dir", help="Local premium index directory path.")
+    parser.add_argument("--local-universe-dir", help="Local universe directory path.")
     parser.add_argument("--max-concurrent", type=int, default=5)
     parser.add_argument("--output-dir", default="data/compare/backtest_pull", help="Report output dir.")
     parser.add_argument("--compare-only", action="store_true", help="Only compare, skip pulling data.")
