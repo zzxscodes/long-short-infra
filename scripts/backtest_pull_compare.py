@@ -113,8 +113,39 @@ def _parse_day(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def _load_universe_symbols() -> list:
+def _load_universe_symbols(target_day: Optional[date] = None) -> list:
+    """
+    加载 universe symbols。
+    如果指定 target_day，则只加载 <= target_day 的 universe（确保使用历史数据对应的 universe）
+    """
     universe_dir = Path(config.get("data.universe_directory", "data/universe"))
+    
+    try:
+        date_dirs = sorted(
+            [d for d in universe_dir.iterdir() if d.is_dir() and len(d.name) == 10 and d.name[4] == "-" and d.name[7] == "-"],
+            reverse=True,
+        )
+        for date_dir in date_dirs:
+            dir_date_str = date_dir.name
+            if target_day:
+                try:
+                    dir_date = datetime.strptime(dir_date_str, "%Y-%m-%d").date()
+                    if dir_date > target_day:
+                        continue
+                except ValueError:
+                    continue
+            csv_path = date_dir / "v1" / "universe.csv"
+            if csv_path.exists():
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    syms = [format_symbol(row.get("symbol", "")) for row in reader if row.get("symbol")]
+                out = [s for s in syms if s]
+                if out:
+                    print(f"  Loaded universe from {dir_date_str}/v1/universe.csv ({len(out)} symbols)")
+                    return out
+    except Exception:
+        pass
+    
     candidate_json = universe_dir / "universe.json"
     if candidate_json.exists():
         try:
@@ -124,41 +155,37 @@ def _load_universe_symbols() -> list:
             else:
                 syms = data
             if isinstance(syms, list):
-                return [format_symbol(s) for s in syms if s]
+                out = [format_symbol(s) for s in syms if s]
+                if out:
+                    print(f"  Loaded universe from universe.json ({len(out)} symbols, fallback)")
+                    return out
         except Exception:
             pass
+    
     candidate_csv = universe_dir / "universe.csv"
     if candidate_csv.exists():
         try:
             with open(candidate_csv, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 syms = [format_symbol(row.get("symbol", "")) for row in reader if row.get("symbol")]
-            return [s for s in syms if s]
+            out = [s for s in syms if s]
+            if out:
+                print(f"  Loaded universe from universe.csv ({len(out)} symbols, fallback)")
+                return out
         except Exception:
             pass
-    try:
-        date_dirs = sorted(
-            [d for d in universe_dir.iterdir() if d.is_dir() and len(d.name) == 10 and d.name[4] == "-" and d.name[7] == "-"],
-            reverse=True,
-        )
-        for date_dir in date_dirs:
-            csv_path = date_dir / "v1" / "universe.csv"
-            if csv_path.exists():
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    syms = [format_symbol(row.get("symbol", "")) for row in reader if row.get("symbol")]
-                out = [s for s in syms if s]
-                if out:
-                    return out
-    except Exception:
-        pass
+    
     return []
 
 
-def pull_universe_from_live(cfg: PullCompareConfig) -> bool:
+def pull_universe_from_live(cfg: PullCompareConfig, target_day: Optional[date] = None) -> bool:
     """
     从实盘机器拉取 universe 文件到本地
-    尝试拉取: universe.json, universe.csv, 以及最近的日期目录下的 v1/universe.csv
+    
+    Args:
+        cfg: 拉取配置
+        target_day: 目标日期，只拉取 <= target_day 的 universe（确保使用历史数据对应的 universe）
+    
     返回: True 表示至少拉取了一个文件成功
     """
     if not cfg.live_host or not cfg.live_user or not cfg.live_universe_dir:
@@ -169,34 +196,43 @@ def pull_universe_from_live(cfg: PullCompareConfig) -> bool:
     
     success = False
     
-    for filename in ["universe.json", "universe.csv"]:
-        remote_path = f"{cfg.live_universe_dir}/{filename}"
-        local_path = local_universe_dir / filename
-        if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_path, str(local_path)):
-            print(f"  Pulled universe file: {filename}")
-            success = True
-    
     try:
         result = subprocess.run(
             ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
              f"{cfg.live_user}@{cfg.live_host}",
-             f"ls -d {cfg.live_universe_dir}/????-??-?? 2>/dev/null | sort -r | head -5"],
+             f"ls -d {cfg.live_universe_dir}/????-??-?? 2>/dev/null | sort -r | head -10"],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0 and result.stdout.strip():
             date_dirs = result.stdout.strip().split('\n')
             for remote_date_dir in date_dirs:
                 date_name = Path(remote_date_dir).name
+                if target_day:
+                    try:
+                        dir_date = datetime.strptime(date_name, "%Y-%m-%d").date()
+                        if dir_date > target_day:
+                            print(f"  Skipping {date_name} (newer than target {target_day})")
+                            continue
+                    except ValueError:
+                        continue
                 remote_csv = f"{remote_date_dir}/v1/universe.csv"
                 local_date_dir = local_universe_dir / date_name / "v1"
                 local_date_dir.mkdir(parents=True, exist_ok=True)
                 local_csv = local_date_dir / "universe.csv"
                 if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_csv, str(local_csv)):
-                    print(f"  Pulled universe file: {date_name}/v1/universe.csv")
+                    print(f"  Pulled universe file: {date_name}/v1/universe.csv (for target day {target_day})")
                     success = True
                     break
     except Exception as e:
         print(f"  Warning: failed to list remote universe date dirs: {e}", file=sys.stderr)
+    
+    if not success:
+        for filename in ["universe.json", "universe.csv"]:
+            remote_path = f"{cfg.live_universe_dir}/{filename}"
+            local_path = local_universe_dir / filename
+            if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_path, str(local_path)):
+                print(f"  Pulled universe file: {filename} (fallback, may not match target day)")
+                success = True
     
     return success
 
@@ -682,18 +718,20 @@ async def _main_async(args: argparse.Namespace) -> int:
     
     print(f"=== Backtest Pull Compare: {day.isoformat()} ===")
     print(f"Live: {cfg.live_user}@{cfg.live_host}")
+    print(f"Target day: {day.isoformat()} (universe must be <= this date)")
     
     if args.symbols:
         symbols = [format_symbol(s.strip()) for s in args.symbols.split(",") if s.strip()]
     else:
-        symbols = _load_universe_symbols()
+        symbols = _load_universe_symbols(target_day=day)
         if not symbols and cfg.live_universe_dir:
-            print(f"\n[Step 0] Local universe not found, pulling from live machine...")
-            if pull_universe_from_live(cfg):
-                symbols = _load_universe_symbols()
+            print(f"\n[Step 0] Local universe not found, pulling from live machine (for {day})...")
+            if pull_universe_from_live(cfg, target_day=day):
+                symbols = _load_universe_symbols(target_day=day)
     
     if not symbols:
         print("No symbols provided and universe not found (both local and remote).", file=sys.stderr)
+        print(f"Make sure universe exists for date <= {day.isoformat()}", file=sys.stderr)
         return 1
     
     print(f"Symbols: {len(symbols)}")
