@@ -84,6 +84,8 @@ data/backtest_premium_index/**/*.parquet
 data/corrupted_parquet/
 *.corrupted
 *.corrupted.parquet
+# Stress test output (temp_full_system_memory_stress.py uses data/stress_test/)
+data/stress_test/
 # Keep .empty files to preserve directory structure
 !data/**/.empty
 
@@ -92,6 +94,8 @@ logs/**/*.log
 logs/**/*.log.*
 logs/**/*.txt
 logs/**/*.txt.*
+# Script report outputs (temp_full_system_memory_stress.py, data_layer_memory_stress.py)
+logs/**/*.json
 # Keep .empty files to preserve directory structure
 !logs/.empty
 
