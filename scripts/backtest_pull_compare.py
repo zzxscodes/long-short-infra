@@ -335,8 +335,14 @@ async def _fetch_official_5m_klines_from_vision(
                     rows = list(reader)
             result: List[List[Any]] = []
             for r in rows:
-                if len(r) >= 9:
+                if len(r) < 9:
+                    continue
+                if r[0] == "open_time":
+                    continue
+                try:
                     result.append([int(r[0]), r[1], r[2], r[3], r[4], r[5], r[6], r[7], int(r[8])])
+                except (ValueError, TypeError):
+                    continue
             return result
         except Exception as e:
             last_err = e
@@ -376,7 +382,13 @@ async def _fetch_agg_trades_from_vision(
                     rows = list(reader)
             result: List[Dict[str, Any]] = []
             for r in rows:
-                if len(r) >= 7:
+                if len(r) < 7:
+                    continue
+                try:
+                    _ = int(r[0])
+                except (ValueError, TypeError):
+                    continue
+                try:
                     p = float(r[1])
                     q = float(r[2])
                     result.append({
@@ -389,6 +401,8 @@ async def _fetch_agg_trades_from_vision(
                         "T": int(r[5]),
                         "m": r[6].lower() in ("true", "1"),
                     })
+                except (ValueError, TypeError):
+                    continue
             return result
         except Exception as e:
             last_err = e
