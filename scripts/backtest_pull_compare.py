@@ -486,6 +486,16 @@ def _load_local_kline_df(symbol: str, day: date, klines_dir: Path) -> pd.DataFra
         ])
 
 
+def _log_validation_criteria(cfg: PullCompareConfig) -> None:
+    """在日志中输出数据校验的合格定义，便于定时任务排查"""
+    print("  [Data validation criteria] Pass = (missing_local==0 and missing_remote==0 and mismatched_rows==0).")
+    print("  Field tolerances (abs, rel): local vs Binance official 5m klines; within tolerance => match.")
+    tolerances = cfg.tolerances or {}
+    for f in ["open", "high", "low", "close", "volume", "quote_volume", "tradecount"]:
+        t = tolerances.get(f, FieldTolerance(abs=0.0, rel=0.0))
+        print(f"    {f}: abs<={t.abs}, rel<={t.rel}")
+
+
 def _compare_symbol_day(
     *,
     symbol: str,
@@ -756,6 +766,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         print(f"  Pulled: klines={klines_pulled}, funding_rates={funding_pulled}, premium_index={premium_pulled}")
     
     print(f"\n[Step 2] Comparing with official Binance data...")
+    _log_validation_criteria(cfg)
     all_ok, results = await compare_and_fix(
         day=day,
         symbols=symbols,
@@ -765,15 +776,26 @@ async def _main_async(args: argparse.Namespace) -> int:
     
     ok = sum(1 for r in results if r.ok)
     fail = len(results) - ok
+    out_dir = Path(args.output_dir or "data/compare/backtest_pull")
+    report_path = out_dir / f"{day.isoformat()}.json"
+
     print(f"\n=== Summary ===")
     print(f"day={day.isoformat()} total={len(results)} ok={ok} fail={fail}")
-    
-    if fail and args.print_fail:
-        print("\nFailed symbols:")
-        for r in results:
-            if not r.ok:
-                print(f"  - {r.symbol}: missing_local={r.missing_local} missing_remote={r.missing_remote} mismatched={r.mismatched_rows}")
-    
+    pct = (100.0 * ok / len(results)) if results else 0.0
+    print(f"Data quality: {ok}/{len(results)} symbols passed ({pct:.1f}%)")
+    print(f"Report (per-symbol details): {report_path}")
+
+    if fail:
+        n_missing_local = sum(1 for r in results if not r.ok and r.missing_local > 0)
+        n_missing_remote = sum(1 for r in results if not r.ok and r.missing_remote > 0)
+        n_mismatched = sum(1 for r in results if not r.ok and r.mismatched_rows > 0)
+        print(f"Failure breakdown: {n_missing_local} with missing_local, {n_missing_remote} with missing_remote, {n_mismatched} with mismatched_rows")
+        if args.print_fail:
+            print("\nFailed symbols:")
+            for r in results:
+                if not r.ok:
+                    print(f"  - {r.symbol}: missing_local={r.missing_local} missing_remote={r.missing_remote} mismatched={r.mismatched_rows}")
+
     return 0 if all_ok else 2
 
 
