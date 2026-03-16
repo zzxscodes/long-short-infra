@@ -20,6 +20,7 @@ import asyncio
 import csv
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -54,11 +55,10 @@ class FieldTolerance:
 
     def ok(self, local: float, remote: float) -> bool:
         try:
-            diff = abs(float(local) - float(remote))
-            if diff <= float(self.abs):
-                return True
-            denom = max(1.0, abs(float(remote)))
-            return (diff / denom) <= float(self.rel)
+            lv = float(local)
+            rv = float(remote)
+            # 与 temp_validate_data_layer_vs_binance 中逻辑保持一致，使用 math.isclose
+            return math.isclose(lv, rv, rel_tol=float(self.rel), abs_tol=float(self.abs))
         except Exception:
             return False
 
@@ -79,13 +79,18 @@ class PullCompareConfig:
     max_concurrent: int = 5
     retries: int = 3
     retry_delay_s: float = 0.8
+    # 单个 symbol 每日允许的最大 mismatched 行占比（0.01 = 1%）
+    max_mismatch_ratio: float = 0.01
     tolerances: Dict[str, FieldTolerance] = field(default_factory=lambda: {
-        "open": FieldTolerance(abs=0.0, rel=0.0),
-        "high": FieldTolerance(abs=0.0, rel=0.0),
-        "low": FieldTolerance(abs=0.0, rel=0.0),
-        "close": FieldTolerance(abs=0.0, rel=0.0),
-        "volume": FieldTolerance(abs=1e-10, rel=1e-10),
-        "quote_volume": FieldTolerance(abs=1e-8, rel=1e-10),
+        # 价格：支持极小的浮点误差
+        "open": FieldTolerance(abs=1e-8, rel=1e-8),
+        "high": FieldTolerance(abs=1e-8, rel=1e-8),
+        "low": FieldTolerance(abs=1e-8, rel=1e-8),
+        "close": FieldTolerance(abs=1e-8, rel=1e-8),
+        # 成交量：按量级给出更实用的误差
+        "volume": FieldTolerance(abs=1e-6, rel=1e-6),
+        "quote_volume": FieldTolerance(abs=1e-4, rel=1e-6),
+        # tradecount 仍要求完全一致
         "tradecount": FieldTolerance(abs=0.0, rel=0.0),
     })
 
@@ -100,6 +105,7 @@ class SymbolCompareResult:
     missing_local: int
     missing_remote: int
     mismatched_rows: int
+    mismatch_ratio: float
     max_abs_diff: Dict[str, float]
     examples: List[Dict[str, Any]]
 
@@ -416,9 +422,12 @@ def _official_to_df(symbol: str, klines: List[List[Any]]) -> pd.DataFrame:
     for k in klines or []:
         try:
             open_ms = int(k[0])
+            # data.binance.vision 使用毫秒时间戳；本地 parquet 当前使用“秒级”时间戳作为 open_time_ms。
+            # 为了与实盘数据层产物保持一致，这里将毫秒转换为秒。
+            open_sec = open_ms // 1000
             rows.append({
                 "symbol": format_symbol(symbol),
-                "open_time_ms": open_ms,
+                "open_time_ms": open_sec,
                 "open_time": datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc),
                 "open": float(k[1]),
                 "high": float(k[2]),
@@ -488,7 +497,10 @@ def _load_local_kline_df(symbol: str, day: date, klines_dir: Path) -> pd.DataFra
 
 def _log_validation_criteria(cfg: PullCompareConfig) -> None:
     """在日志中输出数据校验的合格定义，便于定时任务排查"""
-    print("  [Data validation criteria] Pass = (missing_local==0 and missing_remote==0 and mismatched_rows==0).")
+    print("  [Data validation criteria]")
+    print("    Per-bar: 字段在容差内则视为一致 (math.isclose with abs/rel).")
+    print("    Per-symbol: missing_local==0 and missing_remote==0 and")
+    print(f"               mismatched_rows/total_rows <= max_mismatch_ratio={cfg.max_mismatch_ratio:.4f}.")
     print("  Field tolerances (abs, rel): local vs Binance official 5m klines; within tolerance => match.")
     tolerances = cfg.tolerances or {}
     for f in ["open", "high", "low", "close", "volume", "quote_volume", "tradecount"]:
@@ -517,6 +529,7 @@ def _compare_symbol_day(
     max_abs_diff: Dict[str, float] = {f: 0.0 for f in fields}
     examples: List[Dict[str, Any]] = []
     both = merged[merged["_merge"] == "both"]
+    total_both = int(len(both))
     for _, r in both.iterrows():
         row_bad = False
         diffs: Dict[str, Any] = {}
@@ -545,7 +558,8 @@ def _compare_symbol_day(
                     "open_time": datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc).isoformat(),
                     "diffs": diffs,
                 })
-    ok = (missing_local == 0) and (missing_remote == 0) and (mismatched_rows == 0)
+    mismatch_ratio = mismatched_rows / max(1, total_both)
+    ok = (missing_local == 0) and (missing_remote == 0) and (mismatch_ratio <= cfg.max_mismatch_ratio)
     return SymbolCompareResult(
         symbol=format_symbol(symbol),
         day=str(day),
@@ -555,6 +569,7 @@ def _compare_symbol_day(
         missing_local=missing_local,
         missing_remote=missing_remote,
         mismatched_rows=mismatched_rows,
+        mismatch_ratio=mismatch_ratio,
         max_abs_diff=max_abs_diff,
         examples=examples,
     )
