@@ -82,14 +82,13 @@ class PullCompareConfig:
     # 单个 symbol 每日允许的最大 mismatched 行占比（0.01 = 1%）
     max_mismatch_ratio: float = 0.01
     tolerances: Dict[str, FieldTolerance] = field(default_factory=lambda: {
-        # 价格：支持极小的浮点误差
-        "open": FieldTolerance(abs=1e-8, rel=1e-8),
-        "high": FieldTolerance(abs=1e-8, rel=1e-8),
-        "low": FieldTolerance(abs=1e-8, rel=1e-8),
-        "close": FieldTolerance(abs=1e-8, rel=1e-8),
-        # 成交量：按量级给出更实用的误差
-        "volume": FieldTolerance(abs=1e-6, rel=1e-6),
-        "quote_volume": FieldTolerance(abs=1e-4, rel=1e-6),
+        # 统一：abs=0, rel=1e-6（按你的要求）
+        "open": FieldTolerance(abs=0.0, rel=1e-6),
+        "high": FieldTolerance(abs=0.0, rel=1e-6),
+        "low": FieldTolerance(abs=0.0, rel=1e-6),
+        "close": FieldTolerance(abs=0.0, rel=1e-6),
+        "volume": FieldTolerance(abs=0.0, rel=1e-6),
+        "quote_volume": FieldTolerance(abs=0.0, rel=1e-6),
         # tradecount 仍要求完全一致
         "tradecount": FieldTolerance(abs=0.0, rel=0.0),
     })
