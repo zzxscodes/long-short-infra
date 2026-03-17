@@ -470,8 +470,12 @@ def _load_local_kline_df(symbol: str, day: date, klines_dir: Path) -> pd.DataFra
             ])
         
         out = df.copy()
+        # 统一 open_time 的解析为 UTC，并且将 join key 标准化为「秒级 epoch」。
+        # 本仓库实盘数据层产出的 parquet 存在不同 datetime 精度/表示（秒/毫秒/纳秒），
+        # 使用 datetime64[ns] 再转 epoch 秒可避免单位不一致导致 merge 全缺失。
         out["open_time"] = pd.to_datetime(out["open_time"], utc=True)
-        out["open_time_ms"] = (out["open_time"].astype("int64") // 1_000_000).astype("int64")
+        out["open_time_sec"] = (out["open_time"].astype("int64") // 1_000_000_000).astype("int64")
+        out["open_time_ms"] = out["open_time_sec"]
         
         for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
             if col not in out.columns:
@@ -555,7 +559,7 @@ def _compare_symbol_day(
                 open_ms = int(r["open_time_ms"])
                 examples.append({
                     "open_time_ms": open_ms,
-                    "open_time": datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc).isoformat(),
+                    "open_time": datetime.fromtimestamp(open_ms, tz=timezone.utc).isoformat(),
                     "diffs": diffs,
                 })
     mismatch_ratio = mismatched_rows / max(1, total_both)
