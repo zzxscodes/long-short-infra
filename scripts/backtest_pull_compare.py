@@ -421,8 +421,7 @@ def _official_to_df(symbol: str, klines: List[List[Any]]) -> pd.DataFrame:
     for k in klines or []:
         try:
             open_ms = int(k[0])
-            # data.binance.vision 使用毫秒时间戳；本地 parquet 当前使用“秒级”时间戳作为 open_time_ms。
-            # 为了与实盘数据层产物保持一致，这里将毫秒转换为秒。
+            # Vision 为毫秒；merge 键统一为 K 线 open 的 Unix 秒（与 _load_local_kline_df 一致）。
             open_sec = open_ms // 1000
             rows.append({
                 "symbol": format_symbol(symbol),
@@ -470,7 +469,8 @@ def _load_local_kline_df(symbol: str, day: date, klines_dir: Path) -> pd.DataFra
         
         out = df.copy()
         out["open_time"] = pd.to_datetime(out["open_time"], utc=True)
-        out["open_time_ms"] = (out["open_time"].astype("int64") // 1_000_000).astype("int64")
+        # 与 _official_to_df / 实盘层一致：merge 键为 K 线 open 的 Unix 秒（字段名历史原因仍叫 open_time_ms）
+        out["open_time_ms"] = (out["open_time"].astype("int64") // 1_000_000_000).astype("int64")
         
         for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
             if col not in out.columns:
@@ -551,10 +551,10 @@ def _compare_symbol_day(
         if row_bad:
             mismatched_rows += 1
             if len(examples) < max_examples:
-                open_ms = int(r["open_time_ms"])
+                open_sec = int(r["open_time_ms"])
                 examples.append({
-                    "open_time_ms": open_ms,
-                    "open_time": datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc).isoformat(),
+                    "open_time_ms": open_sec,
+                    "open_time": datetime.fromtimestamp(open_sec, tz=timezone.utc).isoformat(),
                     "diffs": diffs,
                 })
     mismatch_ratio = mismatched_rows / max(1, total_both)
