@@ -203,6 +203,31 @@ class StrategyProcess:
                 dry_run_flag = bool(config.get('execution.dry_run', False))
                 api_base = (config.get(f"execution.{execution_mode}", {}) or {}).get("api_base")
 
+                # 取本轮快照末端的“最新已完成5min K线”作为价格输入：
+                # - 不从交易所拉取 price
+                # - 使用 DataAPI（本地聚合/落盘）的 close 来做权重->数量转换
+                try:
+                    ref_utc = (
+                        trigger_end_time.astimezone(timezone.utc)
+                        if trigger_end_time
+                        else datetime.now(timezone.utc)
+                    )
+                    current_window_start = ref_utc.replace(
+                        second=0, microsecond=0
+                    ) - timedelta(minutes=ref_utc.minute % 5)
+                    # 对齐 AlphaEngine：取“触发时刻所在窗口的前一根已完成K线”
+                    end_time = current_window_start - timedelta(minutes=5)
+                    begin_time = end_time - timedelta(minutes=5)  # 至少覆盖1根K线
+                    begin_label = self.data_api._get_date_time_label_from_datetime(begin_time)
+                    end_label = self.data_api._get_date_time_label_from_datetime(end_time)
+                    latest_bar_map = self.data_api.get_bar_between(
+                        begin_label, end_label, mode='5min'
+                    )
+                    latest_klines = {k: v for k, v in latest_bar_map.items() if k in weights}
+                except Exception as e:
+                    logger.error(f"Failed to fetch latest klines for price conversion: {e}", exc_info=True)
+                    raise
+
                 # 建立账户级客户端（只用于查询 account_info / price；不下单）
                 import os
 
@@ -248,7 +273,10 @@ class StrategyProcess:
                             raise RuntimeError(f"No client initialized for account {account_id}")
 
                         quantities = await self.position_generator.convert_weights_to_quantities(
-                            client=client, target_positions_weights=weights, account_id=account_id
+                            client=client,
+                            target_positions_weights=weights,
+                            account_id=account_id,
+                            latest_klines=latest_klines,
                         )
 
                         rows = [

@@ -65,9 +65,11 @@ data/klines/**/*.parquet
 data/trades/**/*.parquet
 data/funding_rates/**/*.parquet
 data/premium_index/**/*.parquet
+data/universe/**/*.parquet
 data/positions/*.json
 data/position_history/*.json
 data/universe/**/*.csv
+data/symbol_info/**/*.json
 data/signals/*.json
 data/equity_curve/**/*.json
 data/strategy_reports/**/*.json
@@ -147,6 +149,11 @@ dmypy.json
 *~
 *.lock
 *.lockfile
+nohup.out
+
+# Local config overrides / secrets
+config/local.yaml
+config/*.local.yaml
 
 # Process IDs
 *.pid

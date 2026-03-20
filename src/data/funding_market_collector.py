@@ -80,6 +80,14 @@ class FundingMarketCollector:
         self.ping_interval = int(config.get("data.mark_price_ping_interval_seconds", 20))
         self.ping_timeout = int(config.get("data.mark_price_ping_timeout_seconds", 30))
         self.open_timeout = int(config.get("data.mark_price_open_timeout_seconds", 30))
+        # 分片连接配置：每symbol订阅@indexPrice和@markPrice两个stream
+        # 单连接stream数建议<=200，因此默认每连接80个symbol（160 streams）
+        self.max_symbols_per_connection = int(
+            config.get("data.mark_price_max_symbols_per_connection", 80)
+        )
+        self.batch_connect_stagger_seconds = float(
+            config.get("data.mark_price_batch_connect_stagger_seconds", 0.6)
+        )
 
         # REST API 配置（用于获取真实的已结算资金费率）
         self.api_base = config.get_binance_api_base_for_data_layer()
@@ -162,38 +170,20 @@ class FundingMarketCollector:
     # WebSocket 主循环（与 TradeCollector._websocket_handler_single 对齐）
     # ------------------------------------------------------------------
 
-    async def _websocket_handler(self):
-        """
-        使用组合流订阅各个 symbol 的 @indexPrice 和 @markPrice 流
-        格式: /stream?streams=btcusdt@indexPrice/btcusdt@markPrice/ethusdt@indexPrice/ethusdt@markPrice...
-        """
+    async def _websocket_handler_single(self, symbols_batch: List[str], batch_index: int):
+        """单个批次的WebSocket循环：订阅该批次symbol的@indexPrice和@markPrice。"""
         update_speed = config.get("data.mark_price_update_speed", "3s")
         speed_suffix = "@1s" if update_speed == "1s" else ""
-        
-        # 构建组合流 URL
-        streams = []
-        for symbol in sorted(self.symbols_set):
+
+        streams: List[str] = []
+        for symbol in sorted(symbols_batch):
             symbol_lower = symbol.lower()
             streams.append(f"{symbol_lower}@indexPrice{speed_suffix}")
             streams.append(f"{symbol_lower}@markPrice{speed_suffix}")
-        
+
         stream_str = "/".join(streams)
         ws_url = f"{self.ws_base}/stream?streams={stream_str}"
         reconnect_count = 0
-
-        # Binance 建议每个连接最多 200 个 streams
-        max_streams_per_connection = 200
-        if len(streams) > max_streams_per_connection:
-            logger.warning(
-                f"Stream count ({len(streams)}) exceeds Binance recommended limit "
-                f"({max_streams_per_connection}). Consider reducing symbol count or "
-                f"implementing batch connections."
-            )
-
-        logger.info(
-            f"Connecting to real data streams for {len(self.symbols_set)} symbols "
-            f"(@indexPrice + @markPrice, {len(streams)} streams total)"
-        )
 
         while self.running:
             try:
@@ -202,7 +192,8 @@ class FundingMarketCollector:
                 eff_timeout = max(float(self.ping_timeout), eff_ping + 5.0)
 
                 logger.info(
-                    f"Connecting to real data streams: {len(streams)} streams "
+                    f"Connecting to real data batch {batch_index + 1}: "
+                    f"{len(symbols_batch)} symbols, {len(streams)} streams "
                     f"(ping={eff_ping:.1f}/{eff_timeout:.1f}s)"
                 )
 
@@ -213,7 +204,10 @@ class FundingMarketCollector:
                     close_timeout=10,
                     open_timeout=self.open_timeout,
                 ) as websocket:
-                    logger.info(f"Real data WebSocket connected ({len(streams)} streams)")
+                    logger.info(
+                        f"Real data WebSocket batch {batch_index + 1} connected "
+                        f"({len(streams)} streams)"
+                    )
                     reconnect_count = 0
 
                     while self.running:
@@ -223,16 +217,19 @@ class FundingMarketCollector:
                             await self._process_stream_message(data)
                         except ConnectionClosed as e:
                             log_network_error("Real data WebSocket recv", e)
-                            logger.info("Real data WebSocket closed by server, reconnecting...")
+                            logger.info(
+                                f"Real data WebSocket batch {batch_index + 1} closed, reconnecting..."
+                            )
                             break
                         except Exception as e:
                             log_network_error("Real data message processing", e)
                             break
 
-                    # 防连接风暴：断连后随机延迟再重连，避免与 aggTrade batch 同时涌入
                     if self.running:
-                        stagger = random.uniform(2.0, 5.0)
-                        logger.info(f"Real data waiting {stagger:.1f}s before reconnect (anti-storm)")
+                        stagger = random.uniform(1.0, 3.0) + batch_index * 0.2
+                        logger.info(
+                            f"Real data batch {batch_index + 1} waiting {stagger:.1f}s before reconnect"
+                        )
                         await asyncio.sleep(stagger)
 
             except WebSocketException as e:
@@ -242,7 +239,10 @@ class FundingMarketCollector:
                 self.stats['reconnect_count'] += 1
                 delay = min(self.reconnect_delay * (1.5 ** min(reconnect_count - 1, 3)), 30)
                 log_network_error("Real data WebSocket connect", e)
-                logger.info(f"Real data reconnecting in {delay:.1f}s (#{reconnect_count})")
+                logger.info(
+                    f"Real data batch {batch_index + 1} reconnecting in {delay:.1f}s "
+                    f"(#{reconnect_count})"
+                )
                 await asyncio.sleep(delay)
 
             except (ConnectionTimeoutError, asyncio.TimeoutError) as e:
@@ -252,7 +252,9 @@ class FundingMarketCollector:
                 self.stats['reconnect_count'] += 1
                 delay = min(self.reconnect_delay * (1.5 ** min(reconnect_count - 1, 3)), 30)
                 log_network_error("Real data WebSocket timeout", e)
-                logger.info(f"Real data timeout, reconnecting in {delay:.1f}s")
+                logger.info(
+                    f"Real data batch {batch_index + 1} timeout, reconnecting in {delay:.1f}s"
+                )
                 await asyncio.sleep(delay)
 
             except Exception as e:
@@ -263,13 +265,48 @@ class FundingMarketCollector:
                 self.stats['reconnect_count'] += 1
                 if isinstance(e, (socket.gaierror, OSError)) and "getaddrinfo" in str(e):
                     delay = min(self.reconnect_delay * (1.2 ** min(reconnect_count - 1, 2)), 10)
-                    logger.info(f"Real data DNS error, reconnecting in {delay:.1f}s")
+                    logger.info(
+                        f"Real data batch {batch_index + 1} DNS error, reconnecting in {delay:.1f}s"
+                    )
                 else:
                     delay = min(self.reconnect_delay * (1.5 ** min(reconnect_count - 1, 3)), 30)
                     log_network_error("Real data WebSocket error", e)
-                    logger.info(f"Real data error, reconnecting in {delay:.1f}s")
+                    logger.info(
+                        f"Real data batch {batch_index + 1} error, reconnecting in {delay:.1f}s"
+                    )
                 await asyncio.sleep(delay)
 
+    async def _websocket_handler(self):
+        """
+        使用分片组合流订阅各个symbol的@indexPrice和@markPrice。
+        避免单连接stream过多（历史上1090 streams导致频繁超时重连）。
+        """
+        symbols = sorted(self.symbols_set)
+        if not symbols:
+            logger.warning("No symbols to subscribe in funding market collector")
+            return
+
+        batch_size = max(1, self.max_symbols_per_connection)
+        batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+        total_streams = len(symbols) * 2
+        logger.info(
+            f"Connecting funding market collector with {len(batches)} WebSocket batch(es): "
+            f"{len(symbols)} symbols, total_streams={total_streams}, "
+            f"max_symbols_per_connection={batch_size}"
+        )
+
+        tasks = []
+        for idx, batch in enumerate(batches):
+            t = asyncio.create_task(self._websocket_handler_single(batch, idx))
+            tasks.append(t)
+            await asyncio.sleep(max(0.1, self.batch_connect_stagger_seconds))
+
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
     # ------------------------------------------------------------------
     # 消息处理
     # ------------------------------------------------------------------

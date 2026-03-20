@@ -357,6 +357,7 @@ class DryRunBinanceClient:
         order_type: str,
         quantity: Optional[float] = None,
         price: Optional[float] = None,
+        priceMatch: Optional[str] = None,
         position_side: str = 'BOTH',
         reduce_only: bool = False
     ) -> Dict:
@@ -393,6 +394,7 @@ class DryRunBinanceClient:
             'origQty': quantity,
             'price': price or 0.0,
             'avgPrice': price or 0.0,
+            'priceMatch': priceMatch,
             'timeInForce': 'GTC' if order_type == 'LIMIT' else None,
             'reduceOnly': reduce_only,
             'updateTime': int(time.time() * 1000),
@@ -473,7 +475,16 @@ class DryRunBinanceClient:
         """
         logger.info(f"DRY-RUN: test_order() called for {symbol} {side} {order_type}")
         # 在dry-run模式下，test_order和place_order行为相同（都不实际下单）
-        return await self.place_order(symbol, side, order_type, quantity, price, position_side, reduce_only)
+        return await self.place_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            priceMatch=None,
+            position_side=position_side,
+            reduce_only=reduce_only,
+        )
     
     async def cancel_order(self, symbol: str, order_id: int) -> Dict:
         """取消订单（模拟）"""

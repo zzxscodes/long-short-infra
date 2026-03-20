@@ -922,6 +922,7 @@ class BinanceClient:
         order_type: str,  # MARKET, LIMIT等
         quantity: Optional[float] = None,
         price: Optional[float] = None,
+        priceMatch: Optional[str] = None,
         position_side: str = 'BOTH',  # LONG, SHORT, BOTH
         reduce_only: bool = False,
         margin_type: Optional[str] = None,  # 可选的保证金模式（如果提供则在下单前设置）
@@ -936,6 +937,7 @@ class BinanceClient:
             order_type: 订单类型（MARKET/LIMIT）
             quantity: 数量
             price: 价格（限价单需要）
+            priceMatch: priceMatch 模式（与 price 互斥；部分 LIMIT 定价可用）
             position_side: 持仓方向（LONG/SHORT/BOTH）
             reduce_only: 是否只减仓
             margin_type: 可选的保证金模式（CROSSED/ISOLATED），如果提供则在下单前自动设置
@@ -951,6 +953,8 @@ class BinanceClient:
         """
         try:
             symbol = format_symbol(symbol)
+            if price is not None and priceMatch is not None:
+                raise ValueError("price 和 priceMatch 不能同时传")
             
             # 自动确保合约配置（对策略透明）
             # 在订单执行前，自动检查并设置保证金模式和杠杆倍数
@@ -1028,6 +1032,9 @@ class BinanceClient:
             
             if price is not None:
                 params['price'] = price
+            
+            if priceMatch is not None:
+                params['priceMatch'] = priceMatch
             
             if order_type == 'LIMIT':
                 params['timeInForce'] = 'GTC'  # Good Till Cancel

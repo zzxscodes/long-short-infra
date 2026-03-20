@@ -17,7 +17,7 @@
 - **每日官方K线对比**: 定时对比 Binance 官方 5m K 线与自聚合结果，通过则同步到回测机；不通过则重拉 aggTrade、重聚合后同步
 - **回测数据同步**: 支持两种模式：(1) 实盘机主动推送；(2) **回测机主动拉取**（推荐），从实盘机器拉取数据、对比官方、自动修复不一致
 - **防重复触发**: 策略计算防重复触发机制，确保计算完整性
-- **数据完整性检查**: 多周期数据完整性检查，确保策略触发时机准确
+- **数据完整性检查**: 支持严格完整性模式（覆盖率与最小点数阈值），确保策略触发时机准确
 - **无成交K线处理**: 自动生成无成交时段的K线数据
 - **监控告警**: 实时监控持仓偏差、敞口、账户健康度
 - **净值曲线追踪**: 自动记录账户净值曲线，支持历史数据查看和分析
@@ -328,7 +328,7 @@ universe = strategy_api.get_last_universe(version='v1')
 ### 策略特性
 
 - **防重复触发**: 策略计算过程中自动防止新的data_complete触发，确保计算完整性
-- **数据完整性**: 系统检查所有周期（5min, 1h, 4h, 8h, 12h, 24h）的数据完整性后才触发策略
+- **数据完整性**: 支持严格完整性校验（5m K线 24h=288、funding 最近3天>=9、premium 最近3天>=864）后再触发策略
 - **Universe自动更新**: 每天23:55自动更新Universe，WebSocket自动重新订阅新的交易对
 - **测试策略**: testnet非dry-run模式下使用测试策略（按成交额排序，大的做空，小的做多）
 
@@ -343,7 +343,8 @@ universe = strategy_api.get_last_universe(version='v1')
 
 ### 数据完整性保障
 
-- **多周期检查**: 检查所有周期（5min, 1h, 4h, 8h, 12h, 24h）的数据完整性
+- **严格覆盖检查**: `strict_data_completeness: true` 时，币种覆盖需与 universe 一致
+- **最小点数检查**: 5m K线最近24h至少288条；funding最近3天至少9条；premium最近3天至少864条
 - **窗口关闭判断**: 通过窗口时间判断，确保时间段内的所有交易都已收到
 - **无成交处理**: 自动生成无成交时段的K线，确保数据连续性
 - **防重复触发**: 策略计算过程中防止新的data_complete触发
@@ -502,7 +503,7 @@ python scripts/backtest_pull_compare.py --live-host 192.168.1.100 --live-user qu
 
 ### 通用说明
 
-- Symbol 来源：不传 `--symbols` 时从 universe（`universe.json` 或 `data/universe/{date}/v1/universe.csv`）加载
+- Symbol 来源：不传 `--symbols` 时从 universe（`data/universe/{date}/v1/universe.csv`）加载
 - 回测机需将 `data.klines_directory`、`data.funding_rates_directory`、`data.premium_index_directory` 分别指向对应数据目录，布局为 `{dir}/{SYMBOL}/{YYYY-MM-DD}.parquet`
 
 ## 数据存储结构
@@ -593,14 +594,14 @@ long-short-infra/
 
 ## 注意事项
 
-1. **账户配置**: 如果配置了 `account_id`，必须填写完整的配置信息，否则该账户不会被启动
+1. **账户配置**: 如果配置了 `account_id`，必须填写完整配置；占位 API Key/Secret 会被启动校验自动跳过
 2. **API密钥安全**: 建议使用环境变量配置API密钥
 3. **测试顺序**: 建议按 mock → testnet → live 的顺序进行测试
 4. **实盘交易**: Live模式下会产生真实订单，请确保策略已经充分测试
 5. **日志查看**: 系统日志保存在 `logs/` 目录，建议定期检查
 6. **时间标签范围**: time_label范围为1-288（每天288个5分钟窗口）
 7. **Universe更新**: 每天23:55自动更新Universe，WebSocket会自动重新订阅新的交易对
-8. **数据完整性**: 系统会检查所有周期（5min, 1h, 4h, 8h, 12h, 24h）的数据完整性后才触发策略
+8. **数据完整性**: 可开启严格模式，按 universe 覆盖率与 288/9/864 阈值进行触发前校验
 9. **策略开发**: 推荐使用Calculators架构进行因子开发，支持多研究员协作和并发执行
 10. **Web监控**: 访问 `http://localhost:8080` 查看实时监控界面，支持多账户执行进程状态监控
 11. **Calculators并发**: 默认使用线程池并发执行所有calculators，可通过配置调整为进程池或串行模式
@@ -609,21 +610,12 @@ long-short-infra/
 
 ## 版本更新
 
-### 最新功能
+### 最新功能（当前版本）
 
-- ✅ **每日官方K线对比与回测数据同步**: 支持两种模式：实盘机推送（`daily_official_5m_compare.py`）或回测机拉取（`backtest_pull_compare.py`，推荐），均使用 data.binance.vision 对比校验
-- ✅ **Web监控界面**: 提供实时Web监控面板，支持进程状态、账户信息、系统监控
-- ✅ **多账户执行进程监控**: 支持监控多个账户的执行进程状态
-- ✅ **归集逐笔数据**: 使用@aggTrade替代@trade，减少数据量，提高处理效率
-- ✅ **多周期聚合**: 支持1h, 4h, 8h, 12h, 24h多周期K线聚合
-- ✅ **溢价指数K线**: 新增溢价指数K线采集和查询接口
-- ✅ **Universe版本支持**: 支持v1, v2等版本管理
-- ✅ **StrategyAPI**: 统一封装数据层、系统层、执行层接口
-- ✅ **TWAP/VWAP订单**: 支持时间加权和成交量加权平均价格订单
-- ✅ **防重复触发**: 策略计算防重复触发机制
-- ✅ **多周期数据完整性**: 检查所有周期的数据完整性
-- ✅ **无成交K线处理**: 自动生成无成交时段的K线
-- ✅ **Transtats阈值转换**: 人民币阈值自动转换为USD
-- ✅ **多因子架构**: 支持多研究员独立开发calculators（因子），系统自动发现、并发执行并求和
-- ✅ **因子并发执行**: 默认使用线程池并发执行所有calculators，提升计算性能
-- ✅ **AlphaDataView数据访问接口**: AlphaDataView现在提供与StrategyAPI相同的数据访问接口，Calculator可以通过view参数直接访问所有数据API，包括get_bar_between、get_tran_stats_between、get_funding_rate_between、get_premium_index_bar_between、get_universe等
+- ✅ **严格数据完整性模式**: 支持 `strict_data_completeness: true`，按 universe 严格检查覆盖率；5m K 线按 24h `288` 条校验，funding/premium 按 3 天最小点数校验
+- ✅ **K线补缺闭环**: 当检测到 5m K 线短缺时，自动触发补空窗口逻辑，确保窗口连续性
+- ✅ **Funding/Premium 分批 WebSocket**: `funding_market_collector` 支持按 `mark_price_max_symbols_per_connection` 分批连接，降低单连接 stream 过载导致的超时/重连风险
+- ✅ **实盘启动前账户校验**: `start_all.py` 启动时会校验 live/testnet 账户配置完整性，自动跳过占位密钥账户并给出明确提示
+- ✅ **数据目录分层存储**: 当前默认目录结构为 `data/universe/{date}/v*/universe.csv` 与 `{type}/{SYMBOL}/{YYYY-MM-DD}.parquet`，便于按日审计与回放
+- ✅ **每日官方K线对比与回测同步**: 支持实盘机推送与回测机拉取两种模式，使用 data.binance.vision 做官方对比与修复
+- ✅ **多因子并发执行**: calculators 自动发现并支持线程池并发；`AlphaDataView` 提供统一数据访问接口

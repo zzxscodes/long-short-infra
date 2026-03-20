@@ -55,41 +55,41 @@ data:
   backtest_pull_live_premium_index_dir: "/data/long-short-infra/data/premium_index"
   backtest_pull_live_universe_dir: "/data/long-short-infra/data/universe"  # Universe 目录
   
-  # 数据层进程配置（当前数值按整套系统内存≤2GB 调整）
-  save_interval: 30  # 定期保存间隔（秒），更频繁刷盘控内存
+  # 数据层进程配置
+  save_interval: 60  # 定期保存间隔（秒）
   cleanup_interval: 3600  # 数据清理间隔（秒）
   universe_check_interval: 300  # Universe更新检查间隔（秒，5分钟）
   
   # K线聚合器内存限制
-  kline_aggregator_max_klines: 6  # 每个symbol最多缓存K线数（需覆盖grace窗口）
-  kline_aggregator_max_pending_windows: 6  # 每个symbol最多保留的pending窗口数
+  kline_aggregator_max_klines: 8  # 每个symbol最多缓存K线数（需覆盖grace窗口，避免晚到成交回补时丢失基线）
+  kline_aggregator_max_pending_windows: 8  # 每个symbol最多保留的pending窗口数（精度优先，配合grace窗口）
   kline_aggregator_max_trades_per_window: 0  # 每窗口成交上限；0表示不截断（保证聚合口径一致）
   # pending窗口内逐笔压缩：超过阈值时把旧逐笔压缩为窗口统计，仅保留尾部逐笔，避免内存线性增长
-  kline_aggregator_pending_compact_threshold: 200
-  kline_aggregator_pending_compact_keep_tail: 40
+  kline_aggregator_pending_compact_threshold: 300
+  kline_aggregator_pending_compact_keep_tail: 60
   # 按窗口年龄分层压缩（旧窗口更激进；内存高压时会再动态收紧）
-  kline_aggregator_pending_compact_old_window_threshold: 80
-  kline_aggregator_pending_compact_old_window_keep_tail: 15
-  kline_aggregator_pending_compact_current_window_threshold: 180
-  kline_aggregator_pending_compact_current_window_keep_tail: 30
+  kline_aggregator_pending_compact_old_window_threshold: 120
+  kline_aggregator_pending_compact_old_window_keep_tail: 20
+  kline_aggregator_pending_compact_current_window_threshold: 260
+  kline_aggregator_pending_compact_current_window_keep_tail: 40
   # 周期保存时仅快照最近N个窗口，降低全窗口重聚合导致的RSS缓慢抬升
   kline_snapshot_max_windows_per_symbol: 2
   # 软阈值口径区分：list_total（真实对象内存）与compact_total（压缩统计计数）
-  kline_aggregator_pending_compact_trades_soft_limit: 1200000
+  kline_aggregator_pending_compact_trades_soft_limit: 2000000
   kline_close_grace_windows: 2  # 延迟关窗窗口数（允许最近2个窗口接收晚到成交=10分钟）
   
   # DataStorage缓存配置
   storage_schema_cache_max_size: 1  # Schema缓存最大数量
   
   # Trades缓冲区配置（极端优化）
-  trades_buffer_max_size: 120  # 每个symbol缓存上限（降低I/O频率，避免逐笔写盘）
-  trades_buffer_total_max_size: 45000  # 全局缓存上限（超过阈值会触发主动刷盘）
+  trades_buffer_max_size: 200  # 每个symbol缓存上限（降低I/O频率，避免逐笔写盘）
+  trades_buffer_total_max_size: 80000  # 全局缓存上限（超过阈值会触发主动刷盘）
   
   # 内存清理配置（极端优化：更频繁的清理以确保整套系统内存占用在目标范围内）
-  memory_cleanup_interval: 45  # 定期内存清理间隔（秒），更频繁以控内存
-  stats_cleanup_interval: 90  # 统计信息清理间隔（秒）
-  memory_force_rebuild_interval: 45  # kline全量重建周期（cleanup轮次）。<=0禁用周期重建，仅高增长触发
-  memory_aggressive_cleanup_threshold_mb: 600  # 仅当RSS超过此阈值才允许执行激进trim，更早触发以控内存
+  memory_cleanup_interval: 60  # 定期内存清理间隔（秒，1分钟，极端优化：更频繁的清理以控制内存峰值）
+  stats_cleanup_interval: 120  # 统计信息清理间隔（秒，2分钟，极端优化：更频繁的清理）
+  memory_force_rebuild_interval: 60  # kline全量重建周期（cleanup轮次）。<=0禁用周期重建，仅高增长触发
+  memory_aggressive_cleanup_threshold_mb: 900  # 仅当RSS超过此阈值才允许执行激进trim，避免低内存阶段反复重建导致碎片抬升
   
   # ---- 实时标记价格 WebSocket 采集（资金费率 + 溢价指数） ----
   # 通过 !markPrice@arr 流实时接收所有交易对的标记价格/资金费率/指数价格，
@@ -98,6 +98,8 @@ data:
   mark_price_ping_interval_seconds: 20
   mark_price_ping_timeout_seconds: 30
   mark_price_open_timeout_seconds: 30
+  mark_price_max_symbols_per_connection: 80
+  mark_price_batch_connect_stagger_seconds: 0.6
 
   # ---- REST 回填配置（仅启动时一次性拉取历史数据，之后不再轮询） ----
   funding_rate_collect_days: 30  # 启动回填最近N天的资金费率历史
@@ -111,11 +113,15 @@ data:
   history_collect_batch_size: 8
   
   # 数据完整性检查配置
-  completeness_threshold: 0.90  # 数据完整性阈值（90%）- 允许10%的symbol因网络抖动暂缺
+  completeness_threshold: 1.00  # 数据完整性阈值（90%）- 允许10%的symbol因网络抖动暂缺
   data_complete_retry_throttle: 10.0  # data_complete重试节流时间（秒）
   data_complete_retry_attempts: 3  # data_complete重试次数
   data_complete_retry_delays: [0.05, 0.2, 0.5]  # data_complete重试延迟（秒）
   incomplete_symbols_log_interval: 5.0  # 不完整symbol日志记录间隔（秒）
+  strict_data_completeness: true  # 严格完整性：币种覆盖必须与universe一致
+  strict_funding_min_points_3d: 9  # 最近3天资金费率最小条数（3天*每天3次）
+  strict_premium_min_points_3d: 864  # 最近3天溢价指数最小条数（3天*288）
+  strict_kline_min_points_24h: 288  # 最近24小时5min K线最小条数（严格288）
 
   # 官方K线对齐（默认关闭；优先修复聚合链路本身）
   kline_reconcile_enabled: false

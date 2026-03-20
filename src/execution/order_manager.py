@@ -277,6 +277,7 @@ class OrderManager:
                     order_type=order_type,
                     quantity=quantity,
                     price=order.get('price'),
+                    priceMatch=order.get('priceMatch'),
                     position_side=position_side,
                     reduce_only=reduce_only
                 )
@@ -288,6 +289,7 @@ class OrderManager:
                     order_type=order_type,
                     quantity=quantity,
                     price=order.get('price'),
+                    priceMatch=order.get('priceMatch'),
                     position_side=position_side,
                     reduce_only=reduce_only
                 )
@@ -456,150 +458,126 @@ class OrderManager:
         }
     
     async def get_symbol_info(self, symbol: str) -> Dict:
-        """获取交易对的精度等信息"""
+        """获取交易对的精度等信息（优先读数据层维护的基础信息表）"""
         symbol = format_symbol(symbol)
-        
+
         # 使用简单的缓存（可以扩展为更复杂的缓存机制）
         if not hasattr(self, '_symbol_info_cache'):
             self._symbol_info_cache: Dict[str, Dict] = {}
-            self._symbol_info_cache_max_size = config.get('execution.order_manager.symbol_info_cache_max_size', 500)
+            self._symbol_info_cache_max_size = config.get(
+                'execution.order_manager.symbol_info_cache_max_size', 500
+            )
             self._symbol_info_cache_access_time: Dict[str, float] = {}
-        
+
         if symbol in self._symbol_info_cache:
             # 更新访问时间
             import time
             self._symbol_info_cache_access_time[symbol] = time.time()
             return self._symbol_info_cache[symbol]
-        
-        try:
-            exchange_info = await self.client.get_exchange_info()
-            
-            for sym_info in exchange_info.get('symbols', []):
-                if format_symbol(sym_info.get('symbol', '')) == symbol:
-                    # 提取精度信息
-                    tick_size = config.get('execution.order.default_tick_size')
-                    step_size = config.get('execution.order.default_step_size')
-                    min_qty = config.get('execution.order.default_min_qty')
-                    min_notional = config.get('execution.order.default_min_notional')
-                    if tick_size is None:
-                        raise ValueError("Missing config key: execution.order.default_tick_size")
-                    if step_size is None:
-                        raise ValueError("Missing config key: execution.order.default_step_size")
-                    if min_qty is None:
-                        raise ValueError("Missing config key: execution.order.default_min_qty")
-                    if min_notional is None:
-                        raise ValueError("Missing config key: execution.order.default_min_notional")
-                    
-                    for filter_item in sym_info.get('filters', []):
-                        filter_type = filter_item.get('filterType', '')
-                        if filter_type == 'PRICE_FILTER':
-                            tick_size = float(filter_item.get('tickSize', '0.01'))
-                        elif filter_type == 'LOT_SIZE':
-                            step_size = float(filter_item.get('stepSize', '0.01'))
-                            min_qty = float(filter_item.get('minQty', '0.001'))
-                        elif filter_type == 'MIN_NOTIONAL':
-                            min_notional_str = filter_item.get('notional', '5.0')
-                            try:
-                                min_notional = float(min_notional_str)
-                            except (ValueError, TypeError):
-                                min_notional = 5.0
-                    
-                    info = {
-                        'symbol': symbol,
-                        'tick_size': tick_size,
-                        'step_size': step_size,
-                        'min_qty': min_qty,
-                        'min_notional': min_notional,
-                    }
-                    
-                    # 检查缓存大小，如果超过限制则清理最久未访问的
-                    import time
-                    current_time = time.time()
-                    if len(self._symbol_info_cache) >= self._symbol_info_cache_max_size:
-                        # LRU清理：删除最久未访问的，直到满足限制
-                        sorted_symbols = sorted(
-                            self._symbol_info_cache_access_time.items(),
-                            key=lambda x: x[1]
-                        )
-                        # 删除最旧的，直到满足限制（保留最新的N个）
-                        to_remove = len(sorted_symbols) - self._symbol_info_cache_max_size + 1
-                        to_remove = max(1, to_remove)  # 至少删除1个
-                        for sym, _ in sorted_symbols[:to_remove]:
-                            if sym in self._symbol_info_cache:
-                                del self._symbol_info_cache[sym]
-                            if sym in self._symbol_info_cache_access_time:
-                                del self._symbol_info_cache_access_time[sym]
-                    
-                    self._symbol_info_cache[symbol] = info
-                    self._symbol_info_cache_access_time[symbol] = current_time
-                    return info
-            
-            # 如果没有找到，返回默认值
-            default_info = {
-                'symbol': symbol,
-                'tick_size': config.get('execution.order.default_tick_size'),
-                'step_size': config.get('execution.order.default_step_size'),
-                'min_qty': config.get('execution.order.default_min_qty'),
-                'min_notional': config.get('execution.order.default_min_notional'),
-            }
-            if default_info['tick_size'] is None:
-                raise ValueError("Missing config key: execution.order.default_tick_size")
-            if default_info['step_size'] is None:
-                raise ValueError("Missing config key: execution.order.default_step_size")
-            if default_info['min_qty'] is None:
-                raise ValueError("Missing config key: execution.order.default_min_qty")
-            if default_info['min_notional'] is None:
-                raise ValueError("Missing config key: execution.order.default_min_notional")
-            self._symbol_info_cache[symbol] = default_info
-            return default_info
-            
-        except Exception as e:
-            if hasattr(self.client, 'dry_run_mode') and self.client.dry_run_mode:
-                logger.debug(f"Dry-run mode: using default symbol info for {symbol} due to error: {e}")
-            else:
-                logger.error(f"Failed to get symbol info for {symbol}: {e}")
-            
-            default_info = {
-                'symbol': symbol,
-                'tick_size': config.get('execution.order.default_tick_size'),
-                'step_size': config.get('execution.order.default_step_size'),
-                'min_qty': config.get('execution.order.default_min_qty'),
-                'min_notional': config.get('execution.order.default_min_notional'),
-            }
-            if default_info['tick_size'] is None:
-                raise ValueError("Missing config key: execution.order.default_tick_size")
-            if default_info['step_size'] is None:
-                raise ValueError("Missing config key: execution.order.default_step_size")
-            if default_info['min_qty'] is None:
-                raise ValueError("Missing config key: execution.order.default_min_qty")
-            if default_info['min_notional'] is None:
-                raise ValueError("Missing config key: execution.order.default_min_notional")
-            if not hasattr(self, '_symbol_info_cache'):
-                self._symbol_info_cache = {}
-                self._symbol_info_cache_max_size = config.get('execution.order_manager.symbol_info_cache_max_size', 500)
-                self._symbol_info_cache_access_time = {}
-            
-            # 检查缓存大小，如果超过限制则清理最久未访问的
-            import time
-            current_time = time.time()
-            if len(self._symbol_info_cache) >= self._symbol_info_cache_max_size:
-                # LRU清理：删除最久未访问的，直到满足限制
-                sorted_symbols = sorted(
-                    self._symbol_info_cache_access_time.items(),
-                    key=lambda x: x[1]
-                )
-                # 删除最旧的，直到满足限制（保留最新的N个）
-                to_remove = len(sorted_symbols) - self._symbol_info_cache_max_size + 1
-                to_remove = max(1, to_remove)  # 至少删除1个
-                for sym, _ in sorted_symbols[:to_remove]:
-                    if sym in self._symbol_info_cache:
-                        del self._symbol_info_cache[sym]
-                    if sym in self._symbol_info_cache_access_time:
-                        del self._symbol_info_cache_access_time[sym]
-            
-            self._symbol_info_cache[symbol] = default_info
-            self._symbol_info_cache_access_time[symbol] = current_time
-            return default_info
+
+        import time
+        table_path = config.get(
+            'data.symbol_basic_info_table_path',
+            'data/symbol_info/symbol_basic_info.json',
+        )
+        table_ttl_seconds = float(
+            config.get(
+                'execution.order_manager.symbol_basic_info_table_ttl_seconds',
+                3600,
+            )
+        )
+
+        # 表级缓存：避免每个 symbol 都去读文件
+        if not hasattr(self, '_symbol_basic_info_table_cache'):
+            self._symbol_basic_info_table_cache: Dict[str, Dict] = {}
+            self._symbol_basic_info_table_loaded_at: float = 0.0
+
+        now = time.time()
+        if (
+            not self._symbol_basic_info_table_cache
+            or (now - self._symbol_basic_info_table_loaded_at) > table_ttl_seconds
+        ):
+            try:
+                import json
+                from pathlib import Path
+
+                p = Path(table_path)
+                if p.exists():
+                    raw = p.read_text(encoding='utf-8')
+                    data = json.loads(raw) if raw.strip() else {}
+                    if isinstance(data, dict):
+                        self._symbol_basic_info_table_cache = data
+                    else:
+                        self._symbol_basic_info_table_cache = {}
+                else:
+                    # 文件不存在就保持为空，后面会回退默认值
+                    self._symbol_basic_info_table_cache = {}
+
+                self._symbol_basic_info_table_loaded_at = now
+            except Exception as e:
+                if hasattr(self.client, 'dry_run_mode') and self.client.dry_run_mode:
+                    logger.debug(
+                        f"Dry-run mode: failed to load symbol basic info table: {e}"
+                    )
+                else:
+                    logger.error(
+                        f"Failed to load symbol basic info table from {table_path}: {e}",
+                        exc_info=True,
+                    )
+                self._symbol_basic_info_table_cache = {}
+                self._symbol_basic_info_table_loaded_at = now
+
+        entry = self._symbol_basic_info_table_cache.get(symbol) if self._symbol_basic_info_table_cache else None
+
+        # 默认值（用于兜底/缺失字段）
+        default_tick_size = config.get('execution.order.default_tick_size')
+        default_step_size = config.get('execution.order.default_step_size')
+        default_min_qty = config.get('execution.order.default_min_qty')
+        default_min_notional = config.get('execution.order.default_min_notional')
+
+        if default_tick_size is None:
+            raise ValueError("Missing config key: execution.order.default_tick_size")
+        if default_step_size is None:
+            raise ValueError("Missing config key: execution.order.default_step_size")
+        if default_min_qty is None:
+            raise ValueError("Missing config key: execution.order.default_min_qty")
+        if default_min_notional is None:
+            raise ValueError("Missing config key: execution.order.default_min_notional")
+
+        if isinstance(entry, dict) and entry:
+            tick_size = entry.get('tick_size', default_tick_size)
+            step_size = entry.get('step_size', default_step_size)
+            min_qty = entry.get('min_qty', default_min_qty)
+            min_notional = entry.get('min_notional', default_min_notional)
+        else:
+            tick_size = default_tick_size
+            step_size = default_step_size
+            min_qty = default_min_qty
+            min_notional = default_min_notional
+
+        info = {
+            'symbol': symbol,
+            'tick_size': float(tick_size),
+            'step_size': float(step_size),
+            'min_qty': float(min_qty),
+            'min_notional': float(min_notional),
+        }
+
+        # LRU清理：删除最久未访问的，直到满足限制
+        if len(self._symbol_info_cache) >= self._symbol_info_cache_max_size:
+            sorted_symbols = sorted(
+                self._symbol_info_cache_access_time.items(),
+                key=lambda x: x[1],
+            )
+            to_remove = len(sorted_symbols) - self._symbol_info_cache_max_size + 1
+            to_remove = max(1, to_remove)
+            for sym, _ in sorted_symbols[:to_remove]:
+                self._symbol_info_cache.pop(sym, None)
+                self._symbol_info_cache_access_time.pop(sym, None)
+
+        self._symbol_info_cache[symbol] = info
+        self._symbol_info_cache_access_time[symbol] = now
+        return info
     
     async def normalize_orders(self, orders: List[Dict]) -> List[Dict]:
         """
@@ -735,33 +713,11 @@ class OrderManager:
             order['execution_method_reason'] = decision.reason
 
             if method == METHOD_LIMIT:
-                # limit 定价需要当前价；若拿不到价则降级为 MARKET
-                if px is None or px <= 0:
-                    order['order_type'] = METHOD_MARKET
-                    order.pop('price', None)
-                    order['execution_method_reason'] = f"{decision.reason}; no_price -> MARKET"
-                    continue
-
-                limit_cfg = config.get('execution.method_selection.limit')
-                if not limit_cfg or not isinstance(limit_cfg, dict):
-                    raise ValueError("Missing config section: execution.method_selection.limit")
-                offset_pct = limit_cfg.get('price_offset_pct')
-                if offset_pct is None:
-                    raise ValueError("Missing config key: execution.method_selection.limit.price_offset_pct")
-
-                px_f = float(px)
-                off = float(offset_pct)
-                raw_price = px_f * (1.0 - off) if str(side).upper() == 'BUY' else px_f * (1.0 + off)
-
-                # 价格按 tick_size 处理：BUY 向下取整、SELL 向上取整，避免意外吃单
-                symbol_info = await self.get_symbol_info(symbol)
-                if symbol_info.get('tick_size') is None:
-                    raise ValueError(f"Symbol info missing tick_size for {symbol}: {symbol_info}")
-                tick = float(symbol_info.get('tick_size'))
-                limit_price = self._round_limit_price(raw_price, tick_size=tick, side=str(side).upper())
-
+                # 暂时统一使用 priceMatch=QUEUE：无需显式传 price
                 order['order_type'] = METHOD_LIMIT
-                order['price'] = limit_price
+                order.pop('price', None)
+                order['priceMatch'] = 'QUEUE'
+                order['execution_method_reason'] = f"{decision.reason}; priceMatch=QUEUE"
             elif method in [METHOD_TWAP, METHOD_VWAP, METHOD_MARKET]:
                 order['order_type'] = method
                 order.pop('price', None)
@@ -983,27 +939,6 @@ class OrderManager:
         else:
             await self.place_market_order(symbol=symbol, side=side, quantity=remaining_qty, reduce_only=reduce_only)
     
-    async def _convert_weights_to_quantities(self, target_positions: Dict[str, float]) -> Dict[str, float]:
-        """
-        将权重转换为实际数量
-        支持 CROSSED（全仓）和 ISOLATED（逐仓）两种保证金模式
-        
-        Args:
-            target_positions: Dict[symbol, weight]，目标持仓权重（如0.5表示50%的账户权益）
-        
-        Returns:
-            Dict[symbol, quantity]，转换后的实际数量
-        """
-        try:
-            return await self.position_generator.convert_weights_to_quantities(
-                client=self.client,
-                target_positions_weights=target_positions,
-                account_id=self.account_id,
-            )
-        except Exception as e:
-            logger.error(f"Failed to convert weights to quantities: {e}", exc_info=True)
-            return target_positions
-    
     async def place_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False) -> Optional[Dict]:
         """
         下市价单
@@ -1087,7 +1022,13 @@ class OrderManager:
             return None
     
     async def place_limit_order(
-        self, symbol: str, side: str, quantity: float, price: float, reduce_only: bool = False
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: Optional[float] = None,
+        priceMatch: Optional[str] = None,
+        reduce_only: bool = False,
     ) -> Optional[Dict]:
         """
         下限价单
@@ -1096,13 +1037,19 @@ class OrderManager:
             symbol: 交易对
             side: 方向，'BUY' 或 'SELL'
             quantity: 数量
-            price: 限价
+            price: 限价（与 priceMatch 互斥）
+            priceMatch: priceMatch 模式（与 price 互斥）
             reduce_only: 是否只减仓
         
         Returns:
             订单结果
         """
         try:
+            if price is not None and priceMatch is not None:
+                raise ValueError("price 和 priceMatch 不能同时传")
+            if price is None and priceMatch is None:
+                raise ValueError("price 或 priceMatch 至少需要传一个")
+
             position_side = 'BOTH'
             try:
                 if not self.dry_run:
@@ -1118,9 +1065,9 @@ class OrderManager:
                 order_type='LIMIT',
                 quantity=quantity,
                 price=price,
+                priceMatch=priceMatch,
                 position_side=position_side,
-                reduce_only=reduce_only,
-                time_in_force='GTC'
+                reduce_only=reduce_only
             )
             return result
         except Exception as e:
@@ -1269,31 +1216,21 @@ class OrderManager:
                 
                 if limit_volume > min_qty:
                     limit_volume = round_qty(limit_volume, step_size)
-                    
-                    # 获取订单簿价格
-                    orderbook_prices = await self._get_orderbook_prices(symbol)
-                    if orderbook_prices:
-                        if trade_side == 'BUY':
-                            limit_price = orderbook_prices['bid1']  # 买入用 bid1
-                        else:  # SELL
-                            limit_price = orderbook_prices['ask1']  # 卖出用 ask1
-                        
-                        # 规范化价格
-                        tick_size = symbol_info.get('tick_size', 0.01)
-                        import math
-                        limit_price = round(limit_price / tick_size) * tick_size
-                        
-                        order_result = await self.place_limit_order(
-                            symbol, trade_side, limit_volume, limit_price, reduce_only
+
+                    # 暂时统一使用 priceMatch=QUEUE：无需显式传价格
+                    order_result = await self.place_limit_order(
+                        symbol=symbol,
+                        side=trade_side,
+                        quantity=limit_volume,
+                        priceMatch='QUEUE',
+                        reduce_only=reduce_only,
+                    )
+                    if order_result:
+                        orders.append(order_result)
+                        logger.debug(
+                            f"TWAP step {step_idx+1}/{num_steps} limit(order priceMatch=QUEUE): "
+                            f"{symbol} {trade_side} {limit_volume:.6f}"
                         )
-                        if order_result:
-                            orders.append(order_result)
-                            logger.debug(
-                                f"TWAP step {step_idx+1}/{num_steps} limit order: {symbol} {trade_side} "
-                                f"{limit_volume:.6f} @ {limit_price:.6f}"
-                            )
-                    else:
-                        logger.warning(f"TWAP: Cannot get orderbook prices for {symbol}, skipping limit order")
             
                 # 检查是否已达到目标
                 current_position = await self._get_current_position(symbol)

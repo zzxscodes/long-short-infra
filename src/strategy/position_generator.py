@@ -215,15 +215,25 @@ class PositionGenerator:
         client,
         target_positions_weights: Dict[str, float],
         account_id: Optional[str] = None,
+        latest_klines: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> Dict[str, float]:
         """
         将权重转换为币种数量：qty = M * leverage * alpha / price
         其中 M 为账户总资产 totalWalletBalance（USDT），alpha 为归一化后的权重。
+
+        注意：
+        - price 不从交易所拉取，而是使用本轮策略已经生成/采集的 K 线里的最新一根 `close`。
+        - `latest_klines` 的 key 需要是系统交易对格式（例如 `btc-usdt`），value 为包含 `close` 列的 DataFrame。
         """
         if not target_positions_weights:
             return {}
 
         try:
+            if latest_klines is None:
+                raise ValueError(
+                    "latest_klines is required for price input (do not fetch price from exchange)"
+                )
+
             account_info = await client.get_account_info()
             if not account_info:
                 raise RuntimeError("No account info available")
@@ -254,13 +264,28 @@ class PositionGenerator:
                 if abs(alpha_f) <= 1e-12:
                     continue
 
-                # 支持系统符号（btc-usdt）或交易所符号（BTCUSDT）
-                symbol = to_exchange_symbol(sym)
-                current_price = await client.get_symbol_price(symbol)
-                if not current_price or float(current_price) <= 0:
-                    raise RuntimeError(f"Invalid price for {symbol}: {current_price}")
+                # 从本轮的最新K线中取 close 作为 price
+                df = latest_klines.get(sym)
+                if df is None or getattr(df, "empty", True):
+                    logger.warning(f"Missing latest kline for {sym}; skip quantity conversion")
+                    continue
+                if "close" not in df.columns:
+                    logger.warning(f"Latest kline for {sym} has no 'close' column; skip")
+                    continue
+
+                close_val = df["close"].iloc[-1]
+                try:
+                    current_price = float(close_val)
+                except (TypeError, ValueError):
+                    current_price = 0.0
+
+                if current_price <= 0:
+                    logger.warning(f"Invalid latest close price for {sym}: {close_val}; skip")
+                    continue
 
                 qty = (abs(alpha_f) * notional_capital) / float(current_price)
+                # 返回交易所符号：BTCUSDT
+                symbol = to_exchange_symbol(sym)
                 result[format_symbol(symbol)] = qty if alpha_f > 0 else -qty
 
             logger.info(

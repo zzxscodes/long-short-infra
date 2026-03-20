@@ -34,6 +34,7 @@ from ..data.api import get_data_api
 from ..data.funding_rate_collector import FundingRateCollector
 from ..data.premium_index_collector import get_premium_index_collector
 from ..data.funding_market_collector import FundingMarketCollector
+from ..data.symbol_basic_info_manager import get_symbol_basic_info_manager
 
 logger = get_logger('data_layer')
 
@@ -53,6 +54,10 @@ class DataLayerProcess:
             self.universe_manager = MockUniverseManager()
         else:
             self.universe_manager = get_universe_manager()
+
+        self.symbol_basic_info_manager = (
+            None if self.is_mock_mode else get_symbol_basic_info_manager()
+        )
         
         self.storage = get_data_storage()
         self.kline_aggregator: Optional[KlineAggregator] = None
@@ -135,6 +140,21 @@ class DataLayerProcess:
         self.premium_index_collect_interval = config.get('data.premium_index_collect_interval', 300)
         self.last_premium_index_collect_time = 0
         self.premium_index_collect_days = config.get('data.premium_index_collect_days', 7)
+
+        # 严格数据完整性配置（默认开启）
+        # 要求：币种覆盖与universe一致；5min窗口必须全量完成；历史窗口最小点数达到完整标准
+        self.strict_data_completeness = bool(
+            config.get('data.strict_data_completeness', True)
+        )
+        self.strict_funding_min_points_3d = int(
+            config.get('data.strict_funding_min_points_3d', 9)
+        )  # 3天*每天3次资金费率
+        self.strict_premium_min_points_3d = int(
+            config.get('data.strict_premium_min_points_3d', 864)
+        )  # 3天*24h*12(5min)
+        self.strict_kline_min_points_24h = int(
+            config.get('data.strict_kline_min_points_24h', 288)
+        )
 
         # WebSocket 实时资金费率缓冲（FundingMarketCollector 回调写入，_periodic_save 刷盘）
         self._ws_funding_rate_buffer: Dict[str, List[Dict]] = {}
@@ -500,10 +520,17 @@ class DataLayerProcess:
                     
                     symbols_complete += 1
                 
-                # 计算数据完整度阈值：至少 N% 的交易对拥有当前窗口的最新K线
-                # 这样可以处理交易量极少或断连后重连恢复中的交易对
-                completeness_threshold = config.get('data.completeness_threshold', 0.95)  # 默认95%阈值
-                min_symbols_complete = int(len(universe) * completeness_threshold)
+                # 计算数据完整度阈值：
+                # - 严格模式：必须100%币种完成（与universe完全一致）
+                # - 非严格模式：允许按比例阈值放宽
+                if self.strict_data_completeness:
+                    completeness_threshold = 1.0
+                    min_symbols_complete = len(universe)
+                else:
+                    completeness_threshold = float(
+                        config.get('data.completeness_threshold', 0.95)
+                    )
+                    min_symbols_complete = int(len(universe) * completeness_threshold)
                 
                 # 检查条件：已完成当前窗口的交易对数量达到阈值
                 # symbols_complete: 拥有当前5min窗口K线的交易对数（不要求100%，允许少量低活跃/重连中的交易对缺失）
@@ -806,6 +833,15 @@ class DataLayerProcess:
         else:
             # dry-run模式下，MockUniverseManager的start()只是设置标志
             await self.universe_manager.start()
+
+        # 2.5 启动币对基础信息表维护（默认每小时一次拉取/覆盖）
+        if not self.is_mock_mode and self.symbol_basic_info_manager:
+            symbol_info_task = asyncio.create_task(
+                self.symbol_basic_info_manager.start()
+            )
+            self._add_task_with_error_handler(
+                symbol_info_task, "symbol_basic_info_manager"
+            )
         
         # 3. 初始化K线聚合器
         self.kline_aggregator = KlineAggregator(
@@ -933,6 +969,10 @@ class DataLayerProcess:
         # 停止Universe管理器
         if self.universe_manager:
             await self.universe_manager.stop()
+
+        # 停止币对基础信息表维护
+        if self.symbol_basic_info_manager:
+            await self.symbol_basic_info_manager.stop()
         
         # 保存所有待处理的K线
         if self.kline_aggregator:
@@ -1155,13 +1195,18 @@ class DataLayerProcess:
             symbols_to_collect = []
             existing_count = 0
             
+            required_funding_points = (
+                self.strict_funding_min_points_3d
+                if self.strict_data_completeness
+                else int(config.get('data.funding_min_points_recent_window', 3))
+            )
             for symbol in symbols:
                 # 检查该交易对是否已有数据（检查最近3天的数据，确保有最新数据）
                 # 使用最近3天而不是整个时间范围，确保总是采集最新数据
                 recent_end_time = datetime.now(timezone.utc)
                 recent_start_time = recent_end_time - timedelta(days=3)
                 existing_data = self.storage.load_funding_rates(symbol, recent_start_time, recent_end_time)
-                if existing_data.empty or len(existing_data) < 3:  # 最近3天至少需要3条数据（每天1条，3天3条）
+                if existing_data.empty or len(existing_data) < required_funding_points:
                     symbols_to_collect.append(symbol)
                     logger.debug(f"{symbol} needs funding rate collection: recent_data={len(existing_data)}")
                 else:
@@ -1337,13 +1382,17 @@ class DataLayerProcess:
             symbols_to_collect = []
             existing_count = 0
             
+            required_premium_points = (
+                self.strict_premium_min_points_3d
+                if self.strict_data_completeness
+                else int(config.get('data.premium_min_points_recent_window', 100))
+            )
             for symbol in symbols:
                 # 检查该交易对是否已有数据（检查最近3天的数据，确保有最新数据）
                 recent_end_time = datetime.now(timezone.utc)
                 recent_start_time = recent_end_time - timedelta(days=3)
                 existing_data = self.storage.load_premium_index_klines(symbol, recent_start_time, recent_end_time)
-                # 5分钟K线，3天应该有约864条（3*24*12），但考虑到可能不完整，至少需要100条
-                if existing_data.empty or len(existing_data) < 100:
+                if existing_data.empty or len(existing_data) < required_premium_points:
                     symbols_to_collect.append(symbol)
                     logger.debug(f"{symbol} needs premium index collection: recent_data={len(existing_data)}")
                 else:
@@ -1491,15 +1540,51 @@ class DataLayerProcess:
                 
                 symbols = list(universe)
                 end_time = datetime.now(timezone.utc)
-                
+
+                # 0. 严格检查5min K线完整性（最近24小时每个symbol至少288根）
+                # 允许“有冗余>288”，但不允许“少于288”。
+                recent_24h_start = end_time - timedelta(days=1)
+                required_kline_points = (
+                    self.strict_kline_min_points_24h
+                    if self.strict_data_completeness
+                    else int(config.get('data.kline_min_points_24h', 288))
+                )
+                missing_kline_symbols = []
+                short_kline_symbols = []
+                for symbol in symbols:
+                    k_df = self.storage.load_klines(symbol, recent_24h_start, end_time)
+                    if k_df.empty:
+                        missing_kline_symbols.append(symbol)
+                        continue
+                    if len(k_df) < required_kline_points:
+                        short_kline_symbols.append(symbol)
+
+                if missing_kline_symbols or short_kline_symbols:
+                    logger.warning(
+                        f"Found kline completeness issues: missing={len(missing_kline_symbols)}, "
+                        f"short={len(short_kline_symbols)}, required_24h_points={required_kline_points}. "
+                        f"missing_sample={missing_kline_symbols[:5]}, short_sample={short_kline_symbols[:5]}"
+                    )
+                    # 主动触发空窗补齐，尽快把5min窗口补到完整状态
+                    if self.kline_aggregator:
+                        try:
+                            await self.kline_aggregator.check_and_generate_empty_windows(symbols)
+                        except Exception as e:
+                            logger.error(f"Failed to auto-complete missing klines: {e}", exc_info=True)
+
                 # 1. 检查资金费率数据完整性
                 if self.funding_rate_collector:
                     missing_funding_rates = []
                     recent_start_time = end_time - timedelta(days=3)
                     
+                    required_funding_points = (
+                        self.strict_funding_min_points_3d
+                        if self.strict_data_completeness
+                        else int(config.get('data.funding_min_points_recent_window', 3))
+                    )
                     for symbol in symbols:
                         existing_data = self.storage.load_funding_rates(symbol, recent_start_time, end_time)
-                        if existing_data.empty or len(existing_data) < 3:
+                        if existing_data.empty or len(existing_data) < required_funding_points:
                             missing_funding_rates.append(symbol)
                     
                     if missing_funding_rates:
@@ -1537,9 +1622,14 @@ class DataLayerProcess:
                     missing_premium_index = []
                     recent_start_time = end_time - timedelta(days=3)
                     
+                    required_premium_points = (
+                        self.strict_premium_min_points_3d
+                        if self.strict_data_completeness
+                        else int(config.get('data.premium_min_points_recent_window', 100))
+                    )
                     for symbol in symbols:
                         existing_data = self.storage.load_premium_index_klines(symbol, recent_start_time, end_time)
-                        if existing_data.empty or len(existing_data) < 100:
+                        if existing_data.empty or len(existing_data) < required_premium_points:
                             missing_premium_index.append(symbol)
                     
                     if missing_premium_index:
