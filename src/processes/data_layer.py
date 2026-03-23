@@ -1518,6 +1518,162 @@ class DataLayerProcess:
                 retry_delay = config.get('data.premium_index_collect_interval', 300)  # 出错后等待配置的间隔再重试
                 await asyncio.sleep(retry_delay)
     
+    @staticmethod
+    def _floor_to_5m(dt: datetime) -> datetime:
+        dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        minute = (dt.minute // 5) * 5
+        return dt.replace(minute=minute)
+
+    @staticmethod
+    def _floor_to_8h(dt: datetime) -> datetime:
+        dt = dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        hour = (dt.hour // 8) * 8
+        return dt.replace(hour=hour)
+
+    def _build_empty_kline_row(self, symbol: str, open_dt: datetime, prev_close: float) -> dict:
+        close_dt = open_dt + timedelta(minutes=5)
+        open_ms = int(open_dt.timestamp() * 1000)
+        close_ms = int(close_dt.timestamp() * 1000)
+        day_start = open_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        minutes_since_midnight = int((open_dt - day_start).total_seconds() // 60)
+        time_lable = minutes_since_midnight // 5 + 1
+        return {
+            "symbol": symbol,
+            "open_time": open_dt,
+            "close_time": close_dt,
+            "quote_volume": 0.0,
+            "trade_count": 0,
+            "interval_minutes": 5,
+            "microsecond_since_trade": close_ms,
+            "span_begin_datetime": open_ms,
+            "span_end_datetime": close_ms,
+            "span_status": "NoTrade",
+            "high": float(prev_close),
+            "low": float(prev_close),
+            "open": float(prev_close),
+            "close": float(prev_close),
+            "vwap": float("nan"),
+            "dolvol": 0.0,
+            "buydolvol": 0.0,
+            "selldolvol": 0.0,
+            "volume": 0.0,
+            "buyvolume": 0.0,
+            "sellvolume": 0.0,
+            "tradecount": 0,
+            "buytradecount": 0,
+            "selltradecount": 0,
+            "time_lable": int(time_lable),
+            "buy_volume": 0.0,
+            "buy_dolvol": 0.0,
+            "buy_trade_count": 0,
+            "sell_volume": 0.0,
+            "sell_dolvol": 0.0,
+            "sell_trade_count": 0,
+            "buy_volume1": 0.0,
+            "buy_volume2": 0.0,
+            "buy_volume3": 0.0,
+            "buy_volume4": 0.0,
+            "buy_dolvol1": 0.0,
+            "buy_dolvol2": 0.0,
+            "buy_dolvol3": 0.0,
+            "buy_dolvol4": 0.0,
+            "buy_trade_count1": 0,
+            "buy_trade_count2": 0,
+            "buy_trade_count3": 0,
+            "buy_trade_count4": 0,
+            "sell_volume1": 0.0,
+            "sell_volume2": 0.0,
+            "sell_volume3": 0.0,
+            "sell_volume4": 0.0,
+            "sell_dolvol1": 0.0,
+            "sell_dolvol2": 0.0,
+            "sell_dolvol3": 0.0,
+            "sell_dolvol4": 0.0,
+            "sell_trade_count1": 0,
+            "sell_trade_count2": 0,
+            "sell_trade_count3": 0,
+            "sell_trade_count4": 0,
+        }
+
+    def _count_missing_kline_windows_for_range(
+        self, symbol: str, start_time: datetime, end_time: datetime
+    ) -> int:
+        k_df = self.storage.load_klines(symbol, start_time, end_time)
+        total = int((end_time - start_time).total_seconds() // 300)
+        if total <= 0:
+            return 0
+        if k_df.empty:
+            return total
+        k_df["open_time"] = pd.to_datetime(k_df["open_time"], utc=True, errors="coerce")
+        k_df = (
+            k_df.dropna(subset=["open_time"])
+            .drop_duplicates(subset=["open_time"], keep="last")
+            .sort_values("open_time")
+        )
+        k_df = k_df[(k_df["open_time"] >= start_time) & (k_df["open_time"] < end_time)]
+        existing = set(k_df["open_time"].tolist())
+        missing = 0
+        for i in range(total):
+            ts = start_time + timedelta(minutes=5 * i)
+            if ts not in existing:
+                missing += 1
+        return missing
+
+    async def _backfill_missing_kline_windows(
+        self, symbols: List[str], start_time: datetime, end_time: datetime
+    ) -> tuple[int, int]:
+        patched_symbols = 0
+        patched_windows = 0
+        for symbol in symbols:
+            try:
+                hist_start = start_time - timedelta(days=1)
+                k_df = self.storage.load_klines(symbol, hist_start, end_time)
+                if k_df.empty:
+                    working = pd.DataFrame(columns=["open_time", "close"])
+                else:
+                    working = k_df.copy()
+                    working["open_time"] = pd.to_datetime(
+                        working["open_time"], utc=True, errors="coerce"
+                    )
+                    if "close" in working.columns:
+                        working["close"] = pd.to_numeric(working["close"], errors="coerce")
+                    else:
+                        working["close"] = 0.0
+                    working = (
+                        working.dropna(subset=["open_time"])
+                        .drop_duplicates(subset=["open_time"], keep="last")
+                        .sort_values("open_time")
+                    )
+
+                existing = set(
+                    working[
+                        (working["open_time"] >= start_time)
+                        & (working["open_time"] < end_time)
+                    ]["open_time"].tolist()
+                )
+                total = int((end_time - start_time).total_seconds() // 300)
+                new_rows: List[dict] = []
+                for i in range(total):
+                    open_dt = start_time + timedelta(minutes=5 * i)
+                    if open_dt in existing:
+                        continue
+                    prev = working[working["open_time"] < open_dt]
+                    prev_close = float(prev.iloc[-1]["close"]) if not prev.empty else 0.0
+                    row = self._build_empty_kline_row(symbol, open_dt, prev_close)
+                    new_rows.append(row)
+                    working = pd.concat(
+                        [working, pd.DataFrame([{"open_time": open_dt, "close": float(prev_close)}])],
+                        ignore_index=True,
+                    )
+                if new_rows:
+                    self.storage.save_klines(symbol, pd.DataFrame(new_rows))
+                    patched_symbols += 1
+                    patched_windows += len(new_rows)
+            except Exception as e:
+                logger.error(f"Failed to backfill kline windows for {symbol}: {e}", exc_info=True)
+
+        return patched_symbols, patched_windows
+
     async def _check_and_complete_data(self):
         """定期检查数据完整性并自动补全缺失数据（每1小时检查一次）"""
         # 等待初始采集完成后再开始检查
@@ -1541,9 +1697,10 @@ class DataLayerProcess:
                 symbols = list(universe)
                 end_time = datetime.now(timezone.utc)
 
-                # 0. 严格检查5min K线完整性（最近24小时每个symbol至少288根）
+                # 0. 严格检查5min K线完整性（最近24小时已结算窗口）
                 # 允许“有冗余>288”，但不允许“少于288”。
-                recent_24h_start = end_time - timedelta(days=1)
+                settled_5m_end = self._floor_to_5m(end_time)
+                recent_24h_start = settled_5m_end - timedelta(days=1)
                 required_kline_points = (
                     self.strict_kline_min_points_24h
                     if self.strict_data_completeness
@@ -1552,11 +1709,13 @@ class DataLayerProcess:
                 missing_kline_symbols = []
                 short_kline_symbols = []
                 for symbol in symbols:
-                    k_df = self.storage.load_klines(symbol, recent_24h_start, end_time)
-                    if k_df.empty:
+                    missing_count = self._count_missing_kline_windows_for_range(
+                        symbol, recent_24h_start, settled_5m_end
+                    )
+                    if missing_count >= required_kline_points:
                         missing_kline_symbols.append(symbol)
                         continue
-                    if len(k_df) < required_kline_points:
+                    if missing_count > 0:
                         short_kline_symbols.append(symbol)
 
                 if missing_kline_symbols or short_kline_symbols:
@@ -1565,7 +1724,17 @@ class DataLayerProcess:
                         f"short={len(short_kline_symbols)}, required_24h_points={required_kline_points}. "
                         f"missing_sample={missing_kline_symbols[:5]}, short_sample={short_kline_symbols[:5]}"
                     )
-                    # 主动触发空窗补齐，尽快把5min窗口补到完整状态
+                    # 主动做“全缺口回填”，而不是只补上一根空窗
+                    patched_symbols, patched_windows = await self._backfill_missing_kline_windows(
+                        symbols=symbols,
+                        start_time=recent_24h_start,
+                        end_time=settled_5m_end,
+                    )
+                    logger.info(
+                        f"Kline hole backfill completed: patched_symbols={patched_symbols}, "
+                        f"patched_windows={patched_windows}, range=[{recent_24h_start}, {settled_5m_end})"
+                    )
+                    # 兼容保留：继续补上一窗口空窗
                     if self.kline_aggregator:
                         try:
                             await self.kline_aggregator.check_and_generate_empty_windows(symbols)
@@ -1575,7 +1744,8 @@ class DataLayerProcess:
                 # 1. 检查资金费率数据完整性
                 if self.funding_rate_collector:
                     missing_funding_rates = []
-                    recent_start_time = end_time - timedelta(days=3)
+                    settled_funding_end = self._floor_to_8h(end_time)
+                    recent_start_time = settled_funding_end - timedelta(days=3)
                     
                     required_funding_points = (
                         self.strict_funding_min_points_3d
@@ -1583,14 +1753,16 @@ class DataLayerProcess:
                         else int(config.get('data.funding_min_points_recent_window', 3))
                     )
                     for symbol in symbols:
-                        existing_data = self.storage.load_funding_rates(symbol, recent_start_time, end_time)
+                        existing_data = self.storage.load_funding_rates(
+                            symbol, recent_start_time, settled_funding_end
+                        )
                         if existing_data.empty or len(existing_data) < required_funding_points:
                             missing_funding_rates.append(symbol)
                     
                     if missing_funding_rates:
                         logger.warning(f"Found {len(missing_funding_rates)} symbols with missing funding rate data, auto-completing...")
                         # 采集最近7天的数据以确保完整性
-                        start_time = end_time - timedelta(days=7)
+                        start_time = settled_funding_end - timedelta(days=7)
                         max_concurrent = config.get('data.history_collect_max_concurrent', 2)
                         batch_size = config.get('data.history_collect_batch_size', 25)
                         saved_count = 0
@@ -1599,7 +1771,7 @@ class DataLayerProcess:
                             funding_rates_map = await self.funding_rate_collector.fetch_funding_rates_bulk(
                                 symbols=batch_symbols,
                                 start_time=start_time,
-                                end_time=end_time,
+                                end_time=settled_funding_end,
                                 max_concurrent=max_concurrent
                             )
                             for symbol, df in funding_rates_map.items():
@@ -1610,7 +1782,9 @@ class DataLayerProcess:
                                     except Exception as e:
                                         logger.error(f"Failed to save funding rates for {symbol} during auto-completion: {e}")
                                 else:
-                                    self.storage.ensure_funding_rate_placeholder(symbol, end_time)
+                                    self.storage.ensure_funding_rate_placeholder(
+                                        symbol, settled_funding_end
+                                    )
                             del funding_rates_map
                             import gc
                             gc.collect()
@@ -1620,7 +1794,8 @@ class DataLayerProcess:
                 # 2. 检查溢价指数K线数据完整性
                 if self.premium_index_collector:
                     missing_premium_index = []
-                    recent_start_time = end_time - timedelta(days=3)
+                    settled_5m_end = self._floor_to_5m(end_time)
+                    recent_start_time = settled_5m_end - timedelta(days=3)
                     
                     required_premium_points = (
                         self.strict_premium_min_points_3d
@@ -1628,14 +1803,16 @@ class DataLayerProcess:
                         else int(config.get('data.premium_min_points_recent_window', 100))
                     )
                     for symbol in symbols:
-                        existing_data = self.storage.load_premium_index_klines(symbol, recent_start_time, end_time)
+                        existing_data = self.storage.load_premium_index_klines(
+                            symbol, recent_start_time, settled_5m_end
+                        )
                         if existing_data.empty or len(existing_data) < required_premium_points:
                             missing_premium_index.append(symbol)
                     
                     if missing_premium_index:
                         logger.warning(f"Found {len(missing_premium_index)} symbols with missing premium index data, auto-completing...")
                         # 采集最近7天的数据以确保完整性
-                        start_time = end_time - timedelta(days=7)
+                        start_time = settled_5m_end - timedelta(days=7)
                         max_concurrent = config.get('data.history_collect_max_concurrent', 5)
                         batch_size = config.get('data.history_collect_batch_size', 25)
                         saved_count = 0
@@ -1644,7 +1821,7 @@ class DataLayerProcess:
                             premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
                                 symbols=batch_symbols,
                                 start_time=start_time,
-                                end_time=end_time,
+                                end_time=settled_5m_end,
                                 interval='5m',
                                 max_concurrent=max_concurrent
                             )
