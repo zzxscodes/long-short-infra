@@ -47,6 +47,9 @@ from src.common.utils import ensure_directory, format_symbol
 
 DATA_VISION_BASE = "https://data.binance.vision"
 
+# 默认报告输出目录（prepare_backtest_history_data 与之保持一致，便于同一目录查看 *.json）
+DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR = "data/compare/backtest_pull"
+
 
 @dataclass(frozen=True)
 class FieldTolerance:
@@ -75,6 +78,8 @@ class PullCompareConfig:
     local_funding_rates_dir: str = ""
     local_premium_index_dir: str = ""
     local_universe_dir: str = ""
+    # 仅历史准备脚本写 aggTrade parquet；日更对比脚本不用
+    local_trades_dir: str = ""
     timeout_s: float = 60.0
     max_concurrent: int = 5
     retries: int = 3
@@ -393,7 +398,12 @@ def _save_premium_history(symbol: str, day: date, remote_df: pd.DataFrame, premi
 
 
 async def compare_funding_and_premium(
-    *, day: date, symbols: Sequence[str], cfg: PullCompareConfig, max_concurrent: int
+    *,
+    day: date,
+    symbols: Sequence[str],
+    cfg: PullCompareConfig,
+    max_concurrent: int,
+    persist_binance_for_backtest: bool,
 ) -> Tuple[List[FundingCompareResult], List[PremiumCompareResult]]:
     funding_dir = Path(cfg.local_funding_rates_dir)
     premium_dir = Path(cfg.local_premium_index_dir)
@@ -419,13 +429,11 @@ async def compare_funding_and_premium(
                 remote_p = pd.DataFrame(columns=["key", "open", "high", "low", "close"])
             f_res = _compare_funding_symbol(sym, day, local_f, remote_f)
             p_res = _compare_premium_symbol(sym, day, local_p, remote_p)
-            # 对 funding/premium 失败的 symbol，用 Binance history 覆盖修复后再复检。
-            if not f_res.ok and not remote_f.empty:
+            # 0.2 下载到的 Binance funding/premium 留作回测使用（覆盖本地）。
+            if persist_binance_for_backtest and not remote_f.empty:
                 _save_funding_history(sym, day, remote_f, funding_dir)
-                f_res = _compare_funding_symbol(sym, day, _load_local_funding_df(sym, day, funding_dir), remote_f)
-            if not p_res.ok and not remote_p.empty:
+            if persist_binance_for_backtest and not remote_p.empty:
                 _save_premium_history(sym, day, remote_p, premium_dir)
-                p_res = _compare_premium_symbol(sym, day, _load_local_premium_df(sym, day, premium_dir), remote_p)
             return f_res, p_res
         pairs = await asyncio.gather(*(one(s) for s in symbols))
     for f, p in pairs:
@@ -443,16 +451,22 @@ def _parse_day(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def _load_universe_symbols(target_day: Optional[date] = None) -> list:
+def _load_universe_symbols(
+    target_day: Optional[date] = None,
+    universe_dir: Optional[Path] = None,
+) -> list:
     """
     加载 universe symbols。
     如果指定 target_day，则只加载 <= target_day 的 universe（确保使用历史数据对应的 universe）
+    universe_dir: 为 None 时用 config 的 data.universe_directory；否则与 --local-universe-dir 一致。
     """
-    universe_dir = Path(config.get("data.universe_directory", "data/universe"))
+    base = Path(universe_dir) if universe_dir is not None else Path(
+        config.get("data.universe_directory", "data/universe")
+    )
     
     try:
         date_dirs = sorted(
-            [d for d in universe_dir.iterdir() if d.is_dir() and len(d.name) == 10 and d.name[4] == "-" and d.name[7] == "-"],
+            [d for d in base.iterdir() if d.is_dir() and len(d.name) == 10 and d.name[4] == "-" and d.name[7] == "-"],
             reverse=True,
         )
         for date_dir in date_dirs:
@@ -476,7 +490,7 @@ def _load_universe_symbols(target_day: Optional[date] = None) -> list:
     except Exception:
         pass
     
-    candidate_json = universe_dir / "universe.json"
+    candidate_json = base / "universe.json"
     if candidate_json.exists():
         try:
             data = json.loads(candidate_json.read_text(encoding="utf-8"))
@@ -492,7 +506,7 @@ def _load_universe_symbols(target_day: Optional[date] = None) -> list:
         except Exception:
             pass
     
-    candidate_csv = universe_dir / "universe.csv"
+    candidate_csv = base / "universe.csv"
     if candidate_csv.exists():
         try:
             with open(candidate_csv, "r", encoding="utf-8") as f:
@@ -989,18 +1003,18 @@ def _save_klines_parquet(symbol: str, df: pd.DataFrame, day: date, klines_dir: P
         return False
 
 
-async def compare_and_fix(
+async def compare_klines_only(
     *,
     day: date,
     symbols: Sequence[str],
     cfg: PullCompareConfig,
-    output_dir: Optional[Path] = None,
-) -> Tuple[bool, List[SymbolCompareResult]]:
+    max_concurrent: Optional[int] = None,
+) -> List[SymbolCompareResult]:
     """
     对比官方 5m K线与本地数据，对比失败则下载 aggTrade 重新聚合覆盖
     """
     klines_dir = Path(cfg.local_klines_dir)
-    sem = asyncio.Semaphore(max(1, cfg.max_concurrent))
+    sem = asyncio.Semaphore(max(1, int(max_concurrent or cfg.max_concurrent)))
     timeout = aiohttp.ClientTimeout(total=cfg.timeout_s)
     results: List[SymbolCompareResult] = []
     
@@ -1019,47 +1033,40 @@ async def compare_and_fix(
             )
         
         results = await asyncio.gather(*(compare_one(s) for s in symbols))
-    
-    results = sorted(results, key=lambda r: r.symbol)
-    ok_count = sum(1 for r in results if r.ok)
-    fail_symbols = [r.symbol for r in results if not r.ok]
-    
-    if output_dir:
-        ensure_directory(str(output_dir))
-        out_path = output_dir / f"{day.isoformat()}.json"
-        payload = {
-            "day": day.isoformat(),
-            "mode": "backtest_pull",
-            "summary": {"ok": ok_count, "fail": len(fail_symbols), "total": len(results)},
-            "results": [asdict(r) for r in results],
-        }
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Compare report saved: {out_path}")
-    
-    if fail_symbols:
-        print(f"Compare failed for {len(fail_symbols)} symbols, downloading aggTrades to fix...")
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120.0), headers=headers) as session:
-            for sym in fail_symbols:
-                try:
-                    print(f"  Downloading aggTrades for {sym}...")
-                    trades = await _fetch_agg_trades_from_vision(
-                        session, symbol=sym, day=day,
-                        timeout_s=cfg.timeout_s, retries=cfg.retries, retry_delay_s=cfg.retry_delay_s,
-                    )
-                    if not trades:
-                        print(f"    No aggTrades found for {sym}", file=sys.stderr)
-                        continue
-                    klines_df = _aggregate_agg_trades_to_klines(sym, trades)
-                    if klines_df.empty:
-                        print(f"    No klines from aggTrades for {sym}", file=sys.stderr)
-                        continue
-                    if _save_klines_parquet(sym, klines_df, day, klines_dir):
-                        print(f"    Fixed {sym}: {len(klines_df)} bars aggregated from {len(trades)} trades")
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    print(f"    Failed to fix {sym}: {e}", file=sys.stderr)
-    
-    return (len(fail_symbols) == 0, results)
+    return sorted(results, key=lambda r: r.symbol)
+
+
+async def fix_klines_with_aggtrade(
+    *,
+    day: date,
+    symbols: Sequence[str],
+    cfg: PullCompareConfig,
+) -> None:
+    klines_dir = Path(cfg.local_klines_dir)
+    if not symbols:
+        return
+    print(f"Kline compare failed for {len(symbols)} symbols, downloading aggTrades to recompute...")
+    headers = {"User-Agent": "Binance-Data-Vision/1.0"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120.0), headers=headers) as session:
+        for sym in symbols:
+            try:
+                print(f"  Downloading aggTrades for {sym}...")
+                trades = await _fetch_agg_trades_from_vision(
+                    session, symbol=sym, day=day,
+                    timeout_s=cfg.timeout_s, retries=cfg.retries, retry_delay_s=cfg.retry_delay_s,
+                )
+                if not trades:
+                    print(f"    No aggTrades found for {sym}", file=sys.stderr)
+                    continue
+                klines_df = _aggregate_agg_trades_to_klines(sym, trades)
+                if klines_df.empty:
+                    print(f"    No klines from aggTrades for {sym}", file=sys.stderr)
+                    continue
+                if _save_klines_parquet(sym, klines_df, day, klines_dir):
+                    print(f"    Recomputed {sym}: {len(klines_df)} bars aggregated from {len(trades)} trades")
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                print(f"    Failed to recompute {sym}: {e}", file=sys.stderr)
 
 
 async def _main_async(args: argparse.Namespace) -> int:
@@ -1095,11 +1102,12 @@ async def _main_async(args: argparse.Namespace) -> int:
     if args.symbols:
         symbols = [format_symbol(s.strip()) for s in args.symbols.split(",") if s.strip()]
     else:
-        symbols = _load_universe_symbols(target_day=day)
+        uroot = Path(cfg.local_universe_dir)
+        symbols = _load_universe_symbols(target_day=day, universe_dir=uroot)
         if not symbols and cfg.live_universe_dir:
             print(f"\n[Step 0] Local universe not found, pulling from live machine (for {day})...")
             if pull_universe_from_live(cfg, target_day=day):
-                symbols = _load_universe_symbols(target_day=day)
+                symbols = _load_universe_symbols(target_day=day, universe_dir=uroot)
     
     if not symbols:
         print("No symbols provided and universe not found (both local and remote).", file=sys.stderr)
@@ -1113,57 +1121,105 @@ async def _main_async(args: argparse.Namespace) -> int:
         klines_pulled, funding_pulled, premium_pulled = pull_day_data_from_live(day, symbols, cfg)
         print(f"  Pulled: klines={klines_pulled}, funding_rates={funding_pulled}, premium_index={premium_pulled}")
     
-    print(f"\n[Step 2] Comparing and fixing klines with official Binance data...")
+    print(f"\n[Step 2] Download Binance history (funding/premium/kline) and first compare (live)...")
     _log_validation_criteria(cfg)
-    klines_all_ok, klines_results = await compare_and_fix(
+    klines_live_results = await compare_klines_only(
+        day=day, symbols=symbols, cfg=cfg, max_concurrent=int(args.max_concurrent)
+    )
+    funding_live_results, premium_live_results = await compare_funding_and_premium(
         day=day,
         symbols=symbols,
         cfg=cfg,
-        output_dir=None,
+        max_concurrent=int(args.max_concurrent),
+        persist_binance_for_backtest=True,
     )
-    klines_ok = sum(1 for r in klines_results if r.ok)
-    klines_fail = len(klines_results) - klines_ok
 
-    print(f"\n[Step 3] Comparing and fixing funding_rates + premium_index with Binance history...")
-    funding_results, premium_results = await compare_funding_and_premium(
-        day=day, symbols=symbols, cfg=cfg, max_concurrent=int(args.max_concurrent)
-    )
-    funding_ok = sum(1 for r in funding_results if r.ok)
-    funding_fail = len(funding_results) - funding_ok
-    premium_ok = sum(1 for r in premium_results if r.ok)
-    premium_fail = len(premium_results) - premium_ok
-    out_dir = Path(args.output_dir or "data/compare/backtest_pull")
+    klines_live_ok = sum(1 for r in klines_live_results if r.ok)
+    klines_live_fail = len(klines_live_results) - klines_live_ok
+    funding_live_ok = sum(1 for r in funding_live_results if r.ok)
+    funding_live_fail = len(funding_live_results) - funding_live_ok
+    premium_live_ok = sum(1 for r in premium_live_results if r.ok)
+    premium_live_fail = len(premium_live_results) - premium_live_ok
+
+    out_dir = Path(args.output_dir or DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR)
     ensure_directory(str(out_dir))
-    report_path = out_dir / f"{day.isoformat()}.json"
-    payload = {
+    live_report_path = out_dir / f"{day.isoformat()}.live.json"
+    live_payload = {
         "day": day.isoformat(),
-        "mode": "funding_premium_pull_compare",
+        "mode": "backtest_pull_compare_live",
         "summary": {
-            "klines": {"ok": klines_ok, "fail": klines_fail, "total": len(klines_results)},
-            "funding_rates": {"ok": funding_ok, "fail": funding_fail, "total": len(funding_results)},
-            "premium_index": {"ok": premium_ok, "fail": premium_fail, "total": len(premium_results)},
+            "klines": {"ok": klines_live_ok, "fail": klines_live_fail, "total": len(klines_live_results)},
+            "funding_rates": {"ok": funding_live_ok, "fail": funding_live_fail, "total": len(funding_live_results)},
+            "premium_index": {"ok": premium_live_ok, "fail": premium_live_fail, "total": len(premium_live_results)},
         },
-        "klines_results": [asdict(r) for r in klines_results],
-        "funding_rates_results": [asdict(r) for r in funding_results],
-        "premium_index_results": [asdict(r) for r in premium_results],
+        "klines_results": [asdict(r) for r in klines_live_results],
+        "funding_rates_results": [asdict(r) for r in funding_live_results],
+        "premium_index_results": [asdict(r) for r in premium_live_results],
     }
-    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    live_report_path.write_text(json.dumps(live_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 向后兼容：保留无后缀报告为 live 版本。
+    (out_dir / f"{day.isoformat()}.json").write_text(
+        json.dumps(live_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-    print(f"\n=== Summary ===")
+    print(f"\n=== Live Summary ===")
     print(f"day={day.isoformat()}")
-    print(f"klines: total={len(klines_results)} ok={klines_ok} fail={klines_fail}")
-    print(f"funding_rates: total={len(funding_results)} ok={funding_ok} fail={funding_fail}")
-    print(f"premium_index: total={len(premium_results)} ok={premium_ok} fail={premium_fail}")
-    print(f"Report (per-symbol details): {report_path}")
+    print(f"klines(live): total={len(klines_live_results)} ok={klines_live_ok} fail={klines_live_fail}")
+    print(f"funding_rates(live): total={len(funding_live_results)} ok={funding_live_ok} fail={funding_live_fail}")
+    print(f"premium_index(live): total={len(premium_live_results)} ok={premium_live_ok} fail={premium_live_fail}")
+    print(f"Live report: {live_report_path}")
+
+    klines_history_results: List[SymbolCompareResult] = klines_live_results
+    history_report_path = out_dir / f"{day.isoformat()}.history.json"
+    if klines_live_fail > 0:
+        print(f"\n[Step 3] Kline live compare failed, recompute from Binance aggTrade then second compare (history)...")
+        fail_symbols = [r.symbol for r in klines_live_results if not r.ok]
+        await fix_klines_with_aggtrade(day=day, symbols=fail_symbols, cfg=cfg)
+        klines_history_results = await compare_klines_only(
+            day=day, symbols=symbols, cfg=cfg, max_concurrent=int(args.max_concurrent)
+        )
+    else:
+        print(f"\n[Step 3] Kline live compare passed, keep pulled live kline for backtest.")
+
+    klines_history_ok = sum(1 for r in klines_history_results if r.ok)
+    klines_history_fail = len(klines_history_results) - klines_history_ok
+    history_payload = {
+        "day": day.isoformat(),
+        "mode": "backtest_pull_compare_history",
+        "summary": {
+            "klines": {"ok": klines_history_ok, "fail": klines_history_fail, "total": len(klines_history_results)},
+            "funding_rates": {"ok": funding_live_ok, "fail": funding_live_fail, "total": len(funding_live_results)},
+            "premium_index": {"ok": premium_live_ok, "fail": premium_live_fail, "total": len(premium_live_results)},
+        },
+        "klines_results": [asdict(r) for r in klines_history_results],
+        "funding_rates_results": [asdict(r) for r in funding_live_results],
+        "premium_index_results": [asdict(r) for r in premium_live_results],
+    }
+    history_report_path.write_text(json.dumps(history_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\n=== History Summary ===")
+    print(f"day={day.isoformat()}")
+    print(f"klines(history): total={len(klines_history_results)} ok={klines_history_ok} fail={klines_history_fail}")
+    print(f"funding_rates(history-source): total={len(funding_live_results)} ok={funding_live_ok} fail={funding_live_fail}")
+    print(f"premium_index(history-source): total={len(premium_live_results)} ok={premium_live_ok} fail={premium_live_fail}")
+    print(f"History report: {history_report_path}")
+
     if args.print_fail:
-        for group_name, rows in [("klines", klines_results), ("funding_rates", funding_results), ("premium_index", premium_results)]:
+        for group_name, rows in [
+            ("klines.live", klines_live_results),
+            ("klines.history", klines_history_results),
+            ("funding_rates.live", funding_live_results),
+            ("premium_index.live", premium_live_results),
+        ]:
             fails = [r for r in rows if not r.ok]
             if not fails:
                 continue
             print(f"\nFailed symbols ({group_name}):")
             for r in fails:
                 print(f"  - {r.symbol}: missing_local={r.missing_local} missing_remote={r.missing_remote} mismatched={r.mismatched_rows}")
-    return 0 if (klines_all_ok and funding_fail == 0 and premium_fail == 0) else 2
+
+    return 0 if (klines_history_fail == 0 and funding_live_fail == 0 and premium_live_fail == 0) else 2
 
 
 def main() -> int:
@@ -1183,7 +1239,11 @@ def main() -> int:
     parser.add_argument("--local-premium-dir", help="Local premium index directory path.")
     parser.add_argument("--local-universe-dir", help="Local universe directory path.")
     parser.add_argument("--max-concurrent", type=int, default=5)
-    parser.add_argument("--output-dir", default="data/compare/backtest_pull", help="Report output dir.")
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR,
+        help="Report output dir.",
+    )
     parser.add_argument("--compare-only", action="store_true", help="Only compare, skip pulling data.")
     parser.add_argument("--print-fail", action="store_true", help="Print failed symbols and details.")
     args = parser.parse_args()
