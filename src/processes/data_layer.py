@@ -1619,6 +1619,146 @@ class DataLayerProcess:
                 missing += 1
         return missing
 
+    @staticmethod
+    def _build_expected_funding_times(start_time: datetime, end_time: datetime) -> List[datetime]:
+        out: List[datetime] = []
+        t = start_time
+        while t < end_time:
+            out.append(t)
+            t = t + timedelta(hours=8)
+        return out
+
+    @staticmethod
+    def _build_expected_premium_times(start_time: datetime, end_time: datetime) -> List[datetime]:
+        out: List[datetime] = []
+        t = start_time
+        while t < end_time:
+            out.append(t)
+            t = t + timedelta(minutes=5)
+        return out
+
+    def _ensure_funding_grid_complete(
+        self, symbols: List[str], start_time: datetime, end_time: datetime
+    ) -> tuple[int, int]:
+        expected_times = self._build_expected_funding_times(start_time, end_time)
+        patched_symbols = 0
+        patched_points = 0
+        for symbol in symbols:
+            try:
+                df = self.storage.load_funding_rates(symbol, start_time - timedelta(days=7), end_time)
+                if df.empty:
+                    existing = set()
+                    work = pd.DataFrame(columns=["fundingTime", "fundingRate", "markPrice"])
+                else:
+                    work = df.copy()
+                    work["fundingTime"] = pd.to_datetime(work["fundingTime"], utc=True, errors="coerce")
+                    work = (
+                        work.dropna(subset=["fundingTime"])
+                        .drop_duplicates(subset=["fundingTime"], keep="last")
+                        .sort_values("fundingTime")
+                    )
+                    existing = set(
+                        work[
+                            (work["fundingTime"] >= start_time) & (work["fundingTime"] < end_time)
+                        ]["fundingTime"].tolist()
+                    )
+
+                new_rows = []
+                for ts in expected_times:
+                    if ts in existing:
+                        continue
+                    prev = work[work["fundingTime"] < ts]
+                    prev_rate = float(prev.iloc[-1]["fundingRate"]) if (not prev.empty and "fundingRate" in prev.columns) else 0.0
+                    prev_mark = float(prev.iloc[-1]["markPrice"]) if (not prev.empty and "markPrice" in prev.columns) else 0.0
+                    new_rows.append(
+                        {
+                            "symbol": symbol,
+                            "fundingTime": ts,
+                            "fundingRate": prev_rate,
+                            "markPrice": prev_mark,
+                        }
+                    )
+                    work = pd.concat(
+                        [work, pd.DataFrame([{"fundingTime": ts, "fundingRate": prev_rate, "markPrice": prev_mark}])],
+                        ignore_index=True,
+                    )
+
+                if new_rows:
+                    self.storage.save_funding_rates(symbol, pd.DataFrame(new_rows))
+                    patched_symbols += 1
+                    patched_points += len(new_rows)
+            except Exception as e:
+                logger.error(f"Failed to enforce funding grid for {symbol}: {e}", exc_info=True)
+
+        return patched_symbols, patched_points
+
+    def _ensure_premium_grid_complete(
+        self, symbols: List[str], start_time: datetime, end_time: datetime
+    ) -> tuple[int, int]:
+        expected_times = self._build_expected_premium_times(start_time, end_time)
+        patched_symbols = 0
+        patched_points = 0
+        for symbol in symbols:
+            try:
+                df = self.storage.load_premium_index_klines(symbol, start_time - timedelta(days=1), end_time)
+                if df.empty:
+                    existing = set()
+                    work = pd.DataFrame(columns=["open_time", "close"])
+                else:
+                    work = df.copy()
+                    work["open_time"] = pd.to_datetime(work["open_time"], utc=True, errors="coerce")
+                    if "close" in work.columns:
+                        work["close"] = pd.to_numeric(work["close"], errors="coerce")
+                    else:
+                        work["close"] = 0.0
+                    work = (
+                        work.dropna(subset=["open_time"])
+                        .drop_duplicates(subset=["open_time"], keep="last")
+                        .sort_values("open_time")
+                    )
+                    existing = set(
+                        work[
+                            (work["open_time"] >= start_time) & (work["open_time"] < end_time)
+                        ]["open_time"].tolist()
+                    )
+
+                new_rows = []
+                for open_ts in expected_times:
+                    if open_ts in existing:
+                        continue
+                    prev = work[work["open_time"] < open_ts]
+                    prev_close = float(prev.iloc[-1]["close"]) if not prev.empty else 0.0
+                    close_ts = open_ts + timedelta(minutes=5) - timedelta(milliseconds=1)
+                    new_rows.append(
+                        {
+                            "symbol": symbol,
+                            "open_time": open_ts,
+                            "open": prev_close,
+                            "high": prev_close,
+                            "low": prev_close,
+                            "close": prev_close,
+                            "volume": 0.0,
+                            "close_time": close_ts,
+                            "quote_volume": 0.0,
+                            "trade_count": 0,
+                            "taker_buy_base_volume": 0.0,
+                            "taker_buy_quote_volume": 0.0,
+                        }
+                    )
+                    work = pd.concat(
+                        [work, pd.DataFrame([{"open_time": open_ts, "close": prev_close}])],
+                        ignore_index=True,
+                    )
+
+                if new_rows:
+                    self.storage.save_premium_index_klines(symbol, pd.DataFrame(new_rows))
+                    patched_symbols += 1
+                    patched_points += len(new_rows)
+            except Exception as e:
+                logger.error(f"Failed to enforce premium grid for {symbol}: {e}", exc_info=True)
+
+        return patched_symbols, patched_points
+
     async def _backfill_missing_kline_windows(
         self, symbols: List[str], start_time: datetime, end_time: datetime
     ) -> tuple[int, int]:
@@ -1676,14 +1816,13 @@ class DataLayerProcess:
 
     async def _check_and_complete_data(self):
         """定期检查数据完整性并自动补全缺失数据（每1小时检查一次）"""
-        # 等待初始采集完成后再开始检查
-        await asyncio.sleep(3600)  # 等待1小时
+        # 启动后尽快执行首轮完整性修复，避免清库重启后长时间存在“缺口未补”
+        initial_delay = int(config.get('data.integrity_check_initial_delay_seconds', 60))
+        await asyncio.sleep(max(1, initial_delay))
+        check_interval = int(config.get('data.integrity_check_interval_seconds', 3600))
         
         while self.running:
             try:
-                # 等待1小时
-                await asyncio.sleep(3600)  # 1小时 = 3600秒
-                
                 if not self.running:
                     break
                 
@@ -1790,6 +1929,17 @@ class DataLayerProcess:
                             gc.collect()
                         
                         logger.info(f"Auto-completed funding rate data for {saved_count}/{len(missing_funding_rates)} symbols")
+                    # 强制按已结算8h时间栅格补齐（不能缺点）
+                    patched_symbols, patched_points = self._ensure_funding_grid_complete(
+                        symbols=symbols,
+                        start_time=recent_start_time,
+                        end_time=settled_funding_end,
+                    )
+                    if patched_points > 0:
+                        logger.info(
+                            f"Funding settled-grid backfill completed: patched_symbols={patched_symbols}, "
+                            f"patched_points={patched_points}, range=[{recent_start_time}, {settled_funding_end})"
+                        )
                 
                 # 2. 检查溢价指数K线数据完整性
                 if self.premium_index_collector:
@@ -1837,8 +1987,21 @@ class DataLayerProcess:
                             gc.collect()
                         
                         logger.info(f"Auto-completed premium index data for {saved_count}/{len(missing_premium_index)} symbols")
+                    # 强制按已结算5m时间栅格补齐（不能缺点）
+                    patched_symbols, patched_points = self._ensure_premium_grid_complete(
+                        symbols=symbols,
+                        start_time=recent_start_time,
+                        end_time=settled_5m_end,
+                    )
+                    if patched_points > 0:
+                        logger.info(
+                            f"Premium settled-grid backfill completed: patched_symbols={patched_symbols}, "
+                            f"patched_points={patched_points}, range=[{recent_start_time}, {settled_5m_end})"
+                        )
                 
                 logger.info("Data integrity check completed")
+                # 首轮完成后，按配置间隔复查
+                await asyncio.sleep(max(60, check_interval))
                 
             except asyncio.CancelledError:
                 break
