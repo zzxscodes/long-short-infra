@@ -9,7 +9,7 @@ import sys
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import aiohttp
 import pandas as pd
@@ -23,6 +23,7 @@ from src.common.utils import ensure_directory, format_symbol
 from scripts.backtest_pull_compare import (
     DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR,
     PullCompareConfig,
+    SymbolCompareResult,
     _load_local_kline_df,
     _load_universe_symbols,
     _aggregate_agg_trades_to_klines,
@@ -161,52 +162,73 @@ async def _prepare_one_day(
         results = []
 
         async def prepare_symbol(sym: str) -> None:
-            async with sem:
-                funding_df = await _fetch_funding_history(
-                    session,
-                    sym,
-                    day,
-                    retries=max(2, int(cfg.retries)),
-                    retry_delay_s=float(cfg.retry_delay_s),
-                )
-                premium_df = await _fetch_premium_history(
-                    session,
-                    sym,
-                    day,
-                    retries=max(2, int(cfg.retries)),
-                    retry_delay_s=float(cfg.retry_delay_s),
-                )
-                trades = await _fetch_agg_trades_from_vision(
-                    session,
+            remote_df = binance_kline_df_by_symbol.get(sym, pd.DataFrame())
+            try:
+                async with sem:
+                    funding_df = await _fetch_funding_history(
+                        session,
+                        sym,
+                        day,
+                        retries=max(2, int(cfg.retries)),
+                        retry_delay_s=float(cfg.retry_delay_s),
+                    )
+                    premium_df = await _fetch_premium_history(
+                        session,
+                        sym,
+                        day,
+                        retries=max(2, int(cfg.retries)),
+                        retry_delay_s=float(cfg.retry_delay_s),
+                    )
+                    trades = await _fetch_agg_trades_from_vision(
+                        session,
+                        symbol=sym,
+                        day=day,
+                        timeout_s=60.0,
+                        retries=max(2, int(cfg.retries)),
+                        retry_delay_s=float(cfg.retry_delay_s),
+                    )
+
+                if not funding_df.empty:
+                    _save_funding_history(sym, day, funding_df, Path(cfg.local_funding_rates_dir))
+                if not premium_df.empty:
+                    _save_premium_history(sym, day, premium_df, Path(cfg.local_premium_index_dir))
+                if trades:
+                    if persist_trades:
+                        _save_trades_parquet(Path(cfg.local_trades_dir), sym, day, trades)
+                    own_df = _aggregate_agg_trades_to_klines(sym, trades)
+                    if not own_df.empty:
+                        _save_klines_parquet(sym, own_df, day, Path(cfg.local_klines_dir))
+
+                # 与线上一致：用同一套 loader，保证含 open_time_ms 等列（空则返回带列名的空表）
+                local_df = _load_local_kline_df(sym, day, Path(cfg.local_klines_dir))
+                result = _compare_symbol_day(
                     symbol=sym,
                     day=day,
-                    timeout_s=60.0,
-                    retries=max(2, int(cfg.retries)),
-                    retry_delay_s=float(cfg.retry_delay_s),
+                    local_df=local_df,
+                    remote_df=remote_df,
+                    cfg=cfg,
                 )
-
-            if not funding_df.empty:
-                _save_funding_history(sym, day, funding_df, Path(cfg.local_funding_rates_dir))
-            if not premium_df.empty:
-                _save_premium_history(sym, day, premium_df, Path(cfg.local_premium_index_dir))
-            if trades:
-                if persist_trades:
-                    _save_trades_parquet(Path(cfg.local_trades_dir), sym, day, trades)
-                own_df = _aggregate_agg_trades_to_klines(sym, trades)
-                if not own_df.empty:
-                    _save_klines_parquet(sym, own_df, day, Path(cfg.local_klines_dir))
-
-            # 与线上一致：用同一套 loader，保证含 open_time_ms 等列（空则返回带列名的空表）
-            local_df = _load_local_kline_df(sym, day, Path(cfg.local_klines_dir))
-            remote_df = binance_kline_df_by_symbol.get(sym, pd.DataFrame())
-            result = _compare_symbol_day(
-                symbol=sym,
-                day=day,
-                local_df=local_df,
-                remote_df=remote_df,
-                cfg=cfg,
-            )
-            results.append(result)
+                results.append(result)
+            except Exception as e:  # noqa: BLE001
+                # 任何单 symbol 异常都记失败并继续，避免整日任务被中断。
+                print(f"[{day}] {sym} failed: {e}", file=sys.stderr)
+                binance_rows = int(len(remote_df))
+                examples: List[Dict[str, Any]] = [{"error": str(e)}]
+                results.append(
+                    SymbolCompareResult(
+                        symbol=format_symbol(sym),
+                        day=str(day),
+                        ok=False,
+                        live_rows=0,
+                        binance_history_rows=binance_rows,
+                        missing_local=binance_rows,
+                        missing_remote=0,
+                        mismatched_rows=0,
+                        mismatch_ratio=1.0 if binance_rows > 0 else 0.0,
+                        max_ref_diff={},
+                        examples=examples,
+                    )
+                )
 
         await asyncio.gather(*(prepare_symbol(s) for s in universe_symbols))
 

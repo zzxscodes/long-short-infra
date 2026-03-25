@@ -2,8 +2,8 @@
 """
 跨平台安装回测机数据拉取对比定时任务
 
-- Windows: 创建 schtasks，可设置时间（默认 18:30 本地时间，对应 UTC+8 的 UTC 10:30）
-- Linux/macOS: 写入 crontab，可设置时间（默认 UTC 10:30，配合 CRON_TZ=UTC）
+- Windows: 创建 schtasks，可设置时间（默认 20:00 本地时间，对应 UTC+8 的 UTC 12:00）
+- Linux/macOS: 写入 crontab，可设置时间（默认 UTC 12:00，配合 CRON_TZ=UTC）
 
 用法:
   python scripts/setup_backtest_compare_scheduler.py [--time HH:MM]     # 安装
@@ -23,8 +23,8 @@ SCRIPT = PROJECT_ROOT / "scripts" / "backtest_pull_compare.py"
 LOG_FILE = PROJECT_ROOT / "logs" / "backtest_pull_compare.log"
 TASK_NAME = "BacktestPullCompare"
 CRON_COMMENT = "# long-short-infra: backtest pull compare (data.binance.vision)"
-DEFAULT_TIME_WINDOWS = "18:30"
-DEFAULT_TIME_UNIX = "10:30"
+DEFAULT_TIME_WINDOWS = "20:00"
+DEFAULT_TIME_UNIX = "12:00"
 
 
 def _parse_time(hhmm: str) -> tuple[int, int]:
@@ -42,7 +42,17 @@ def _install_unix(run_at: str) -> bool:
         python_bin = PROJECT_ROOT / "quant" / "bin" / "python"
     if not python_bin.exists():
         python_bin = Path("python3")
-    run_cmd = f"cd {PROJECT_ROOT} && {python_bin} scripts/backtest_pull_compare.py --print-fail >> {LOG_FILE} 2>&1"
+    data_base = "/mnt/sda/Simulation/LongShort/backtest_pull_data/compare"
+    report_dir = "/mnt/sda/Simulation/LongShort/compare/backtest_pull"
+    run_cmd = (
+        f"cd {PROJECT_ROOT} && {python_bin} scripts/backtest_pull_compare.py "
+        f"--local-klines-dir {data_base}/klines "
+        f"--local-funding-dir {data_base}/funding_rates "
+        f"--local-premium-dir {data_base}/premium_index "
+        f"--local-universe-dir {data_base}/universe "
+        f"--output-dir {report_dir} "
+        f"--print-fail >> {LOG_FILE} 2>&1"
+    )
     cron_tz = "CRON_TZ=UTC"
     cron_entry = f"{minute} {hour} * * * {run_cmd}"
     try:
@@ -109,7 +119,7 @@ def _install_windows(run_at: str) -> bool:
         print(f"schtasks 失败: {proc.stderr}")
         return False
     print(f"已安装定时任务: 每日 {run_at_st} 执行（系统时区）")
-    print("若需 UTC 10:30，请将系统时区设为 UTC 或将 --time 设为本地对应时刻（如 UTC+8 用 18:30）")
+    print("若需 UTC 12:00，请将系统时区设为 UTC 或将 --time 设为本地对应时刻（如 UTC+8 用 20:00）")
     return True
 
 

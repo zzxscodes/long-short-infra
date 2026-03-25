@@ -214,7 +214,12 @@ async def _fetch_json_with_retries(
 
 
 async def _fetch_funding_history(
-    session: aiohttp.ClientSession, symbol: str, day: date, retries: int, retry_delay_s: float
+    session: aiohttp.ClientSession,
+    symbol: str,
+    day: date,
+    retries: int,
+    retry_delay_s: float,
+    api_base: Optional[str] = None,
 ) -> pd.DataFrame:
     sym = format_symbol(symbol)
     day_str = day.isoformat()
@@ -225,14 +230,16 @@ async def _fetch_funding_history(
         try:
             async with session.get(url, timeout=60.0) as resp:
                 if resp.status == 404:
-                    return pd.DataFrame(columns=["key", "fundingRate", "markPrice"])
+                    rows = []
+                    break
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 zcontent = await resp.read()
             with zipfile.ZipFile(io.BytesIO(zcontent), "r") as zf:
                 names = zf.namelist()
                 if not names:
-                    return pd.DataFrame(columns=["key", "fundingRate", "markPrice"])
+                    rows = []
+                    break
                 with zf.open(names[0]) as f:
                     reader = csv.reader(io.TextIOWrapper(f))
                     rows = list(reader)
@@ -241,6 +248,62 @@ async def _fetch_funding_history(
             last_err = e
             if attempt < retries - 1:
                 await asyncio.sleep(retry_delay_s * (2 ** attempt))
+
+    # data.binance.vision 的 fundingRate 日文件在不少日期会 404；回退到月包（更稳定）
+    if not rows:
+        month_str = day.strftime("%Y-%m")
+        murl = f"{DATA_VISION_BASE}/data/futures/um/monthly/fundingRate/{sym}/{sym}-fundingRate-{month_str}.zip"
+        mrows: List[List[str]] = []
+        try:
+            async with session.get(murl, timeout=60.0) as resp:
+                if resp.status == 404:
+                    mrows = []
+                elif resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                else:
+                    zcontent = await resp.read()
+                    with zipfile.ZipFile(io.BytesIO(zcontent), "r") as zf:
+                        names = zf.namelist()
+                        if names:
+                            with zf.open(names[0]) as f:
+                                reader = csv.reader(io.TextIOWrapper(f))
+                                mrows = list(reader)
+        except Exception as e:
+            print(f"  Warning: fundingRate monthly vision fetch failed for {sym} {month_str}: {e}", file=sys.stderr)
+            mrows = []
+
+        if mrows:
+            day_start_ms = int(pd.Timestamp(f"{day_str}T00:00:00Z").value // 1_000_000)
+            day_end_ms = int(pd.Timestamp(f"{day_str}T23:59:59.999Z").value // 1_000_000)
+            out = []
+            for r in mrows or []:
+                try:
+                    # header: calc_time,funding_interval_hours,last_funding_rate
+                    if r and r[0] in ("calc_time", "symbol"):
+                        continue
+                    ts_ms = int(r[0])
+                    if not (day_start_ms <= ts_ms <= day_end_ms):
+                        continue
+                    out.append(
+                        {
+                            "key": _funding_key(ts_ms),
+                            "fundingRate": float(r[2]),
+                            # monthly csv 不含 markPrice；下游字段要求存在，置 0
+                            "markPrice": 0.0,
+                        }
+                    )
+                except Exception:
+                    continue
+            return (
+                pd.DataFrame(out, columns=["key", "fundingRate", "markPrice"])
+                .drop_duplicates(subset=["key"], keep="last")
+                .sort_values("key")
+            )
+
+    # 不使用 REST：仅依赖 data.binance.vision（日包不存在则用月包）。
+    if not rows:
+        return pd.DataFrame(columns=["key", "fundingRate", "markPrice"])
+
     if not rows and last_err is not None:
         raise RuntimeError(f"fundingRate vision fetch failed: {url} err={last_err}") from last_err
     out = []
