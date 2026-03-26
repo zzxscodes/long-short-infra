@@ -457,6 +457,12 @@ class DataLayerProcess:
                     window_start_s = int(current_timestamp // interval_seconds) * interval_seconds
                     window_start_ms = window_start_s * 1000
                     prev_window_ends[interval] = window_start_ms
+                # 5min窗口的"理想闭合时间"（当前窗口起始时刻）：
+                # 若某symbol最新K线close_time >= 该时刻，则认为上一根5min已到位。
+                prev_window_end_5min = prev_window_ends["5min"]
+                ideal_kline_close_time_utc = datetime.fromtimestamp(
+                    prev_window_end_5min / 1000, tz=timezone.utc
+                )
                 
                 # all_complete: 所有有数据的交易对是否都完成了上一窗口（所有周期）
                 # symbols_with_data: 有K线数据的交易对数量
@@ -506,7 +512,6 @@ class DataLayerProcess:
                     #
                     # prev_window_end_5min 实际上是"当前5分钟窗口的开始时间"(window_start_ms)。
                     # 若最新K线的 close_time 早于该窗口开始，则说明上一窗口还没产出/补齐。
-                    prev_window_end_5min = prev_window_ends["5min"]
                     if latest_close_ms < prev_window_end_5min:
                         all_complete = False
                         incomplete_symbols.append(
@@ -537,7 +542,6 @@ class DataLayerProcess:
                 # 注意：由于其他周期（1h,4h,8h,12h,24h）是从5分钟数据聚合的，如果5分钟数据完整，其他周期也可以聚合
                 if symbols_complete >= min_symbols_complete:
                     # ===== data_complete 去重：同一个5min窗口只通知一次 =====
-                    prev_window_end_5min = prev_window_ends.get('5min')
                     if prev_window_end_5min is not None and self._last_notified_data_complete_5min_end == prev_window_end_5min:
                         # 已经通知过该窗口，避免刷屏触发策略
                         return
@@ -572,10 +576,27 @@ class DataLayerProcess:
                                 # 成功后记录本窗口已通知，确保只通知一次
                                 if prev_window_end_5min is not None:
                                     self._last_notified_data_complete_5min_end = prev_window_end_5min
+                                quality_date = ideal_kline_close_time_utc.strftime("%Y-%m-%d")
+                                quality_time_label = int(
+                                    (ideal_kline_close_time_utc.hour * 60 + ideal_kline_close_time_utc.minute) // 5
+                                ) + 1
+                                delay_seconds = max(
+                                    0.0,
+                                    (current_time - ideal_kline_close_time_utc).total_seconds(),
+                                )
                                 logger.info(
                                     f"Notified data complete (5min,1h,4h,8h,12h,24h) for {len(symbols_with_complete_data)}/{len(universe)} symbols "
                                     f"(complete={symbols_complete}, have_data={symbols_with_data}, incomplete={len(incomplete_symbols)}, "
-                                    f"threshold={min_symbols_complete}) at {current_time}"
+                                    f"threshold={min_symbols_complete}, window_id_5min_ms={prev_window_end_5min}, "
+                                    f"ideal_kline_close_time_utc={ideal_kline_close_time_utc.isoformat()}) at {current_time}"
+                                )
+                                logger.info(
+                                    "KLINE_COMPLETENESS_METRIC | "
+                                    f"date={quality_date}, "
+                                    f"timelabel={quality_time_label:03d}, "
+                                    f"theoretical_complete_ts={ideal_kline_close_time_utc.isoformat()}, "
+                                    f"actual_complete_ts={current_time.isoformat()}, "
+                                    f"delay_seconds={delay_seconds:.3f}"
                                 )
                                 break
                             except Exception as e:
@@ -590,8 +611,6 @@ class DataLayerProcess:
                     # 记录调试信息（定期记录，帮助诊断问题）
                     if incomplete_symbols:
                         # 使用时间戳和窗口ID来节流日志，避免刷屏
-                        prev_window_end_5min = prev_window_ends.get('5min', 0)
-                        
                         # 初始化节流状态
                         if not hasattr(self, '_last_log_window'):
                             self._last_log_window = None
@@ -618,7 +637,8 @@ class DataLayerProcess:
                             logger.info(
                                 f"Data completeness check: {symbols_with_data}/{len(universe)} symbols have data. "
                                 f"Incomplete: {len(incomplete_symbols)} symbols. "
-                                f"Current window: {window_start_5min}, Prev window end: {prev_window_end_5min}. "
+                                f"Current window: {window_start_5min}, Prev window end: {prev_window_end_5min}, "
+                                f"ideal_kline_close_time_utc={ideal_kline_close_time_utc.isoformat()}. "
                                 f"Sample incomplete: {incomplete_symbols[:5] if len(incomplete_symbols) > 5 else incomplete_symbols}"
                             )
                             self._last_log_window = prev_window_end_5min
