@@ -50,6 +50,11 @@ DATA_VISION_BASE = "https://data.binance.vision"
 # 默认报告输出目录（prepare_backtest_history_data 与之保持一致，便于同一目录查看 *.json）
 DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR = "data/compare/backtest_pull"
 
+DEFAULT_PID_PATH = PROJECT_ROOT / "logs" / "backtest_pull_compare.pid"
+
+# Vision 日文件在“刚产出/刚同步”阶段可能短暂 404；对 404 额外重试，避免误判为空数据。
+VISION_404_RETRIES_DEFAULT = 6
+VISION_404_RETRY_DELAY_S_DEFAULT = 3.0
 
 @dataclass(frozen=True)
 class FieldTolerance:
@@ -84,6 +89,8 @@ class PullCompareConfig:
     max_concurrent: int = 5
     retries: int = 3
     retry_delay_s: float = 0.8
+    vision_404_retries: int = VISION_404_RETRIES_DEFAULT
+    vision_404_retry_delay_s: float = VISION_404_RETRY_DELAY_S_DEFAULT
     # 单个 symbol 每日允许的最大 mismatched 行占比（0.01 = 1%）
     max_mismatch_ratio: float = 0.01
     tolerances: Dict[str, FieldTolerance] = field(default_factory=lambda: {
@@ -514,6 +521,54 @@ def _parse_day(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
+def _month_str(day: date) -> str:
+    return f"{day.year:04d}-{day.month:02d}"
+
+
+async def _fetch_vision_zip_csv_rows(
+    session: "aiohttp.ClientSession",
+    *,
+    url: str,
+    timeout_s: float,
+    retries: int,
+    retry_delay_s: float,
+    extra_404_retries: int = 0,
+    extra_404_retry_delay_s: float = 0.0,
+) -> List[List[str]]:
+    """
+    下载 data.binance.vision 的 ZIP（内含 CSV），返回 CSV rows（含 header）。
+
+    注意：Vision 的 daily 文件在“刚生成/刚同步”阶段可能短暂 404，这里把 404 也纳入重试窗口；
+    若最终仍 404，则返回空列表（上层可决定是否 fallback 到 monthly）。
+    """
+    last_err: Optional[BaseException] = None
+    base_attempts = max(1, int(retries))
+    extra_404_attempts = max(0, int(extra_404_retries))
+    total_attempts = base_attempts + extra_404_attempts
+    for attempt in range(total_attempts):
+        try:
+            async with session.get(url, timeout=timeout_s) as resp:
+                if resp.status == 404:
+                    if attempt < total_attempts - 1:
+                        await asyncio.sleep(float(extra_404_retry_delay_s or retry_delay_s))
+                        continue
+                    return []
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status} from data.binance.vision")
+                zcontent = await resp.read()
+            with zipfile.ZipFile(io.BytesIO(zcontent), "r") as zf:
+                names = zf.namelist()
+                if not names:
+                    return []
+                with zf.open(names[0]) as f:
+                    return list(csv.reader(io.TextIOWrapper(f)))
+        except Exception as e:
+            last_err = e
+            if attempt < total_attempts - 1:
+                await asyncio.sleep(float(retry_delay_s) * (2 ** min(attempt, 4)))
+    raise RuntimeError(f"Failed to fetch ZIP/CSV from data.binance.vision: {last_err}") from last_err
+
+
 def _load_universe_symbols(
     target_day: Optional[date] = None,
     universe_dir: Optional[Path] = None,
@@ -729,39 +784,62 @@ async def _fetch_official_5m_klines_from_vision(
     """从 data.binance.vision 下载 5m klines ZIP"""
     sym = format_symbol(symbol)
     day_str = day.isoformat()
-    url = f"{DATA_VISION_BASE}/data/futures/um/daily/klines/{sym}/5m/{sym}-5m-{day_str}.zip"
-    last_err: Optional[BaseException] = None
-    for attempt in range(max(1, retries)):
+    daily_url = f"{DATA_VISION_BASE}/data/futures/um/daily/klines/{sym}/5m/{sym}-5m-{day_str}.zip"
+
+    rows = await _fetch_vision_zip_csv_rows(
+        session,
+        url=daily_url,
+        timeout_s=timeout_s,
+        retries=retries,
+        retry_delay_s=retry_delay_s,
+        extra_404_retries=VISION_404_RETRIES_DEFAULT,
+        extra_404_retry_delay_s=VISION_404_RETRY_DELAY_S_DEFAULT,
+    )
+
+    # daily 不存在/未就绪 -> monthly fallback
+    if not rows:
+        murl = (
+            f"{DATA_VISION_BASE}/data/futures/um/monthly/klines/{sym}/5m/"
+            f"{sym}-5m-{_month_str(day)}.zip"
+        )
+        mrows = await _fetch_vision_zip_csv_rows(
+            session,
+            url=murl,
+            timeout_s=timeout_s,
+            retries=max(1, retries),
+            retry_delay_s=retry_delay_s,
+        )
+        if not mrows:
+            return []
+
+        start_dt = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int((start_dt + timedelta(days=1)).timestamp() * 1000)
+
+        filtered: List[List[str]] = []
+        for r in mrows:
+            if not r or r[0] == "open_time":
+                continue
+            try:
+                ot = int(r[0])
+            except Exception:
+                continue
+            if start_ms <= ot < end_ms:
+                filtered.append(r)
+        # 合成 rows（包含 header，便于兼容原逻辑）
+        rows = [["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_volume", "count"]] + filtered
+
+    result: List[List[Any]] = []
+    for r in rows:
+        if len(r) < 9:
+            continue
+        if r[0] == "open_time":
+            continue
         try:
-            async with session.get(url, timeout=timeout_s) as resp:
-                if resp.status == 404:
-                    return []
-                if resp.status != 200:
-                    raise RuntimeError(f"HTTP {resp.status} from data.binance.vision")
-                zcontent = await resp.read()
-            with zipfile.ZipFile(io.BytesIO(zcontent), "r") as zf:
-                names = zf.namelist()
-                if not names:
-                    return []
-                with zf.open(names[0]) as f:
-                    reader = csv.reader(io.TextIOWrapper(f))
-                    rows = list(reader)
-            result: List[List[Any]] = []
-            for r in rows:
-                if len(r) < 9:
-                    continue
-                if r[0] == "open_time":
-                    continue
-                try:
-                    result.append([int(r[0]), r[1], r[2], r[3], r[4], r[5], r[6], r[7], int(r[8])])
-                except (ValueError, TypeError):
-                    continue
-            return result
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                await asyncio.sleep(retry_delay_s * (2 ** attempt))
-    raise RuntimeError(f"Failed to fetch klines from data.binance.vision for {symbol}: {last_err}") from last_err
+            result.append([int(r[0]), r[1], r[2], r[3], r[4], r[5], r[6], r[7], int(r[8])])
+        except (ValueError, TypeError):
+            continue
+    return result
 
 
 async def _fetch_agg_trades_from_vision(
@@ -776,52 +854,77 @@ async def _fetch_agg_trades_from_vision(
     """从 data.binance.vision 下载 aggTrades ZIP"""
     sym = format_symbol(symbol)
     day_str = day.isoformat()
-    url = f"{DATA_VISION_BASE}/data/futures/um/daily/aggTrades/{sym}/{sym}-aggTrades-{day_str}.zip"
-    last_err: Optional[BaseException] = None
-    for attempt in range(max(1, retries)):
+    daily_url = f"{DATA_VISION_BASE}/data/futures/um/daily/aggTrades/{sym}/{sym}-aggTrades-{day_str}.zip"
+
+    rows = await _fetch_vision_zip_csv_rows(
+        session,
+        url=daily_url,
+        timeout_s=timeout_s,
+        retries=retries,
+        retry_delay_s=retry_delay_s,
+        extra_404_retries=VISION_404_RETRIES_DEFAULT,
+        extra_404_retry_delay_s=VISION_404_RETRY_DELAY_S_DEFAULT,
+    )
+
+    if not rows:
+        murl = (
+            f"{DATA_VISION_BASE}/data/futures/um/monthly/aggTrades/{sym}/"
+            f"{sym}-aggTrades-{_month_str(day)}.zip"
+        )
+        mrows = await _fetch_vision_zip_csv_rows(
+            session,
+            url=murl,
+            timeout_s=timeout_s,
+            retries=max(1, retries),
+            retry_delay_s=retry_delay_s,
+        )
+        if not mrows:
+            return []
+
+        start_dt = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int((start_dt + timedelta(days=1)).timestamp() * 1000)
+
+        filtered: List[List[str]] = []
+        for r in mrows:
+            if not r or r[0] == "agg_trade_id":
+                continue
+            if len(r) < 7:
+                continue
+            try:
+                ts = int(r[5])
+            except Exception:
+                continue
+            if start_ms <= ts < end_ms:
+                filtered.append(r)
+        rows = [["agg_trade_id", "price", "quantity", "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker"]] + filtered
+
+    result: List[Dict[str, Any]] = []
+    for r in rows:
+        if len(r) < 7:
+            continue
+        if r[0] == "agg_trade_id":
+            continue
         try:
-            async with session.get(url, timeout=timeout_s) as resp:
-                if resp.status == 404:
-                    return []
-                if resp.status != 200:
-                    raise RuntimeError(f"HTTP {resp.status} from data.binance.vision")
-                zcontent = await resp.read()
-            with zipfile.ZipFile(io.BytesIO(zcontent), "r") as zf:
-                names = zf.namelist()
-                if not names:
-                    return []
-                with zf.open(names[0]) as f:
-                    reader = csv.reader(io.TextIOWrapper(f))
-                    rows = list(reader)
-            result: List[Dict[str, Any]] = []
-            for r in rows:
-                if len(r) < 7:
-                    continue
-                try:
-                    _ = int(r[0])
-                except (ValueError, TypeError):
-                    continue
-                try:
-                    p = float(r[1])
-                    q = float(r[2])
-                    result.append({
-                        "a": int(r[0]),
-                        "p": p,
-                        "q": q,
-                        "Q": p * q,
-                        "f": int(r[3]) if r[3] else None,
-                        "l": int(r[4]) if r[4] else None,
-                        "T": int(r[5]),
-                        "m": r[6].lower() in ("true", "1"),
-                    })
-                except (ValueError, TypeError):
-                    continue
-            return result
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                await asyncio.sleep(retry_delay_s * (2 ** attempt))
-    raise RuntimeError(f"Failed to fetch aggTrades from data.binance.vision for {symbol}: {last_err}") from last_err
+            _ = int(r[0])
+        except (ValueError, TypeError):
+            continue
+        try:
+            p = float(r[1])
+            q = float(r[2])
+            result.append({
+                "a": int(r[0]),
+                "p": p,
+                "q": q,
+                "Q": p * q,
+                "f": int(r[3]) if r[3] else None,
+                "l": int(r[4]) if r[4] else None,
+                "T": int(r[5]),
+                "m": r[6].lower() in ("true", "1"),
+            })
+        except (ValueError, TypeError):
+            continue
+    return result
 
 
 def _official_to_df(symbol: str, klines: List[List[Any]]) -> pd.DataFrame:
@@ -1134,6 +1237,13 @@ async def fix_klines_with_aggtrade(
 
 async def _main_async(args: argparse.Namespace) -> int:
     day = _parse_day(args.day) if args.day else _default_day_utc()
+
+    # 写入 PID（cron/nohup 都适用），便于排查/停止任务
+    try:
+        DEFAULT_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_PID_PATH.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except Exception:
+        pass
     
     cfg = PullCompareConfig(
         live_host=args.live_host or str(config.get("data.backtest_pull_live_host", "")),
