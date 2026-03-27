@@ -139,7 +139,7 @@ class DataReplayEngine:
         self._current_timestamp = None
         logger.info("Replay engine reset")
     
-    def replay_iterator(self) -> Iterator[Tuple[datetime, Dict[str, KlineSnapshot]]]:
+    def replay_iterator(self, start_after: Optional[datetime] = None) -> Iterator[Tuple[datetime, Dict[str, KlineSnapshot]]]:
         """
         迭代重放所有时间步
         
@@ -150,6 +150,8 @@ class DataReplayEngine:
         
         # 迭代所有时间戳
         for timestamp in self._all_timestamps:
+            if start_after is not None and pd.to_datetime(timestamp) <= pd.to_datetime(start_after):
+                continue
             self._current_timestamp = timestamp
             
             # 为每个交易对获取对应时间戳的K线
@@ -169,6 +171,29 @@ class DataReplayEngine:
             # 只有当有至少一个交易对有数据时才yield
             if klines:
                 yield timestamp, klines
+
+    def get_rolling_window_snapshot(
+        self,
+        timestamp: datetime,
+        window_bars: int,
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        返回截至timestamp的滚动窗口数据，供策略/执行层做窗口特征计算。
+        """
+        if window_bars <= 0:
+            return {}
+
+        result: Dict[str, pd.DataFrame] = {}
+        ts = pd.to_datetime(timestamp)
+        for symbol, historical_kline in self.kline_data.items():
+            df = historical_kline.data
+            if df is None or df.empty or "open_time" not in df.columns:
+                continue
+            open_times = pd.to_datetime(df["open_time"])
+            sliced = df[open_times <= ts].tail(int(window_bars))
+            if not sliced.empty:
+                result[symbol] = sliced.copy()
+        return result
     
     def _get_kline_at_timestamp(self, symbol: str, timestamp: datetime) -> Optional[KlineSnapshot]:
         """获取指定时间戳的K线"""

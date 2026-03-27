@@ -32,6 +32,10 @@ class BacktestConfigManager:
                 'taker_fee': 0.0004,  # 吃单手续费
                 'slippage': 0.0,  # 滑点（万分位）
                 'funding_rate_apply': True,  # 是否应用资金费率
+                'run_mode': 'complete',  # complete / increment
+                'enable_incremental': False,
+                'checkpoint_every_n_steps': 100,
+                'execution_time_labels': None,  # e.g. ["001","013","025"]
             },
             
             # 回测样本
@@ -55,6 +59,7 @@ class BacktestConfigManager:
                 'cache_klines': True,  # 缓存K线数据
                 'parallel_execution': False,  # 并行执行多个回测
                 'max_workers': 4,  # 最大并行数
+                'rolling_window_bars': 0,
             },
         }
     }

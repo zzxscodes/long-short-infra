@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
+import json
 
 from ..common.logger import get_logger
 from .models import BacktestResult
@@ -98,6 +99,11 @@ class BacktestResultSaver:
                 'capital_allocation': result.config.capital_allocation,
                 'long_count': result.config.long_count,
                 'short_count': result.config.short_count,
+                'universe_version': getattr(result.config, 'universe_version', 'v1'),
+                'run_mode': getattr(result.config, 'run_mode', 'complete'),
+                'enable_incremental': getattr(result.config, 'enable_incremental', False),
+                'execution_time_labels': getattr(result.config, 'execution_time_labels', None),
+                'rolling_window_bars': getattr(result.config, 'rolling_window_bars', 0),
             }
             config_path.write_text(json.dumps(config_dict, indent=2, ensure_ascii=False), encoding='utf-8')
             logger.info(f"配置信息已保存: {config_path}")

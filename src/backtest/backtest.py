@@ -23,6 +23,7 @@ from pathlib import Path
 import logging
 import json
 import time
+import os
 
 import pandas as pd
 import numpy as np
@@ -43,6 +44,13 @@ from .models import (
     create_backtest_result,
 )
 from .result_saver import BacktestResultSaver
+from .utils import (
+    get_available_balance_ratio,
+    get_backtest_result_dir,
+    get_default_initial_balance,
+    get_default_interval,
+    get_default_leverage,
+)
 
 logger = logging.getLogger('backtest')
 
@@ -65,6 +73,23 @@ class FactorBacktestConfig:
     
     symbols: Optional[List[str]] = None
     calculator_names: Optional[List[str]] = None
+    enable_incremental: bool = False
+    checkpoint_dir: Optional[str] = None
+    checkpoint_every_n_steps: int = 50
+    universe_version: str = "v1"
+    run_mode: str = "complete"  # complete / increment
+    execution_time_labels: Optional[List[str]] = None
+    rolling_window_bars: int = 1
+    save_alpha: bool = False
+    alpha_output_dir: Optional[str] = None
+
+    def __post_init__(self):
+        if self.initial_balance is None:
+            self.initial_balance = get_default_initial_balance()
+        if self.interval is None:
+            self.interval = get_default_interval()
+        if self.leverage is None:
+            self.leverage = get_default_leverage()
 
 
 @dataclass
@@ -158,8 +183,156 @@ class MultiFactorBacktest:
         
         self.long_positions: Set[str] = set()
         self.short_positions: Set[str] = set()
+        self._checkpoint_steps: int = 0
+        self.factor_weights: Dict[datetime, Dict[str, float]] = {}
+        self.next_returns: Dict[datetime, Dict[str, float]] = {}
         
         self._prepare_symbols()
+
+    def _parse_interval_minutes(self) -> int:
+        interval = str(self.config.interval or "5m").strip().lower()
+        if interval.endswith("m"):
+            return max(1, int(interval[:-1]))
+        if interval.endswith("h"):
+            return max(1, int(interval[:-1]) * 60)
+        return 5
+
+    def _timestamp_to_time_label(self, timestamp: datetime) -> str:
+        ts = pd.to_datetime(timestamp).to_pydatetime()
+        interval_minutes = self._parse_interval_minutes()
+        label = int((ts.hour * 60 + ts.minute) // interval_minutes) + 1
+        return str(label).zfill(3)
+
+    def _is_execution_time(self, timestamp: datetime) -> bool:
+        labels = self.config.execution_time_labels
+        if not labels:
+            return True
+        return self._timestamp_to_time_label(timestamp) in set(labels)
+
+    def _alpha_base_dir(self) -> Path:
+        if self.config.alpha_output_dir:
+            base = Path(self.config.alpha_output_dir)
+        else:
+            base = get_backtest_result_dir() / "alpha_snapshots"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _alpha_snapshot_path(self, timestamp: datetime) -> Path:
+        ts = pd.to_datetime(timestamp).to_pydatetime()
+        yy = ts.strftime("%Y")
+        mm = ts.strftime("%m")
+        dd = ts.strftime("%d")
+        time_label = self._timestamp_to_time_label(ts)
+        filename = f"{self.config.name}.csv.gz"
+        return self._alpha_base_dir() / self.config.universe_version / yy / mm / dd / time_label / filename
+
+    def _alpha_snapshot_exists(self, timestamp: datetime) -> bool:
+        return self._alpha_snapshot_path(timestamp).exists()
+
+    def _save_alpha_snapshot(self, weights: Dict[str, float], timestamp: datetime) -> None:
+        if not self.config.save_alpha:
+            return
+        out = self._alpha_snapshot_path(timestamp)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({"Uid": list(weights.keys()), "Value": list(weights.values())})
+        df.to_csv(out, index=False, encoding="utf-8", compression="gzip")
+
+    def _load_alpha_snapshot(self, timestamp: datetime) -> Dict[str, float]:
+        path = self._alpha_snapshot_path(timestamp)
+        if not path.exists():
+            return {}
+        try:
+            df = pd.read_csv(path, compression="gzip")
+            if "Uid" in df.columns and "Value" in df.columns:
+                return {str(r["Uid"]): float(r["Value"]) for _, r in df.iterrows()}
+            return {}
+        except Exception:
+            return {}
+
+    def _get_checkpoint_path(self) -> Path:
+        checkpoint_root = Path(self.config.checkpoint_dir) if self.config.checkpoint_dir else (get_backtest_result_dir() / "checkpoints")
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        return checkpoint_root / f"{self.config.name}.json"
+
+    def _serialize_trade(self, trade: TradeRecord) -> Dict[str, Any]:
+        return {
+            "timestamp": trade.timestamp.isoformat() if trade.timestamp else None,
+            "symbol": trade.symbol,
+            "side": trade.side,
+            "quantity": trade.quantity,
+            "price": trade.price,
+            "weight_before": trade.weight_before,
+            "weight_after": trade.weight_after,
+            "pnl": trade.pnl,
+            "commission": trade.commission,
+        }
+
+    def _deserialize_trade(self, payload: Dict[str, Any]) -> TradeRecord:
+        ts_raw = payload.get("timestamp")
+        ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now(timezone.utc)
+        return TradeRecord(
+            timestamp=ts,
+            symbol=payload.get("symbol", ""),
+            side=payload.get("side", "LONG"),
+            quantity=float(payload.get("quantity", 0.0)),
+            price=float(payload.get("price", 0.0)),
+            weight_before=float(payload.get("weight_before", 0.0)),
+            weight_after=float(payload.get("weight_after", 0.0)),
+            pnl=float(payload.get("pnl", 0.0)),
+            commission=float(payload.get("commission", 0.0)),
+        )
+
+    def _save_checkpoint(self, last_timestamp: Optional[datetime]) -> None:
+        if not self.config.enable_incremental:
+            return
+        try:
+            payload = {
+                "last_timestamp": last_timestamp.isoformat() if last_timestamp else None,
+                "portfolio_value": float(self.portfolio_value),
+                "current_weights": self.current_weights,
+                "portfolio_history": self.portfolio_history,
+                "trades": [self._serialize_trade(t) for t in self.trades],
+            }
+            path = self._get_checkpoint_path()
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, default=self._json_default),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save backtest checkpoint: {e}", exc_info=True)
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, (datetime, pd.Timestamp)):
+            return value.isoformat()
+        if isinstance(value, (np.integer, np.int64)):
+            return int(value)
+        if isinstance(value, (np.floating, np.float64)):
+            return float(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+    def _load_checkpoint(self) -> Optional[Dict[str, Any]]:
+        if not self.config.enable_incremental:
+            return None
+        path = self._get_checkpoint_path()
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.portfolio_value = float(payload.get("portfolio_value", self.config.initial_balance))
+            self.current_weights = {k: float(v) for k, v in payload.get("current_weights", {}).items()}
+            self.portfolio_history = list(payload.get("portfolio_history", []))
+            for row in self.portfolio_history:
+                if isinstance(row, dict) and row.get("timestamp"):
+                    try:
+                        row["timestamp"] = pd.to_datetime(row["timestamp"])
+                    except Exception:
+                        pass
+            self.trades = [self._deserialize_trade(t) for t in payload.get("trades", [])]
+            return payload
+        except Exception as e:
+            logger.warning(f"Failed to load backtest checkpoint, fallback to full run: {e}", exc_info=True)
+            return None
     
     def _prepare_symbols(self):
         """准备交易对列表"""
@@ -218,9 +391,15 @@ class MultiFactorBacktest:
         bar_data = data_api.get_bar_between(start_label, end_label, mode=self.config.interval)
         
         symbols_in_data = set()
+        normalized_bar_data: Dict[str, pd.DataFrame] = {}
         for sym, df in bar_data.items():
-            if not df.empty:
-                symbols_in_data.add(sym)
+            if df is None or df.empty or "open_time" not in df.columns:
+                continue
+            normalized = df.copy()
+            normalized["open_time"] = pd.to_datetime(normalized["open_time"])
+            normalized = normalized.sort_values("open_time").reset_index(drop=True)
+            normalized_bar_data[sym] = normalized
+            symbols_in_data.add(sym)
         
         valid_symbols = [s for s in self.symbols if s in symbols_in_data]
         if not valid_symbols:
@@ -230,46 +409,108 @@ class MultiFactorBacktest:
             logger.info(f"Valid symbols with data: {len(valid_symbols)}")
         
         timestamps: List[datetime] = []
-        for sym, df in bar_data.items():
-            if sym in valid_symbols and 'open_time' in df.columns:
-                timestamps.extend(df['open_time'].unique().tolist())
+        for sym, df in normalized_bar_data.items():
+            if sym in valid_symbols:
+                timestamps.extend(df["open_time"].unique().tolist())
         
         timestamps = sorted(list(set(timestamps)))
         
         if verbose:
             logger.info(f"Total timestamps: {len(timestamps)}")
+
+        # Build fast O(1) per-timestamp lookup maps (for many calculators)
+        symbol_row_by_ts: Dict[str, Dict[pd.Timestamp, pd.Series]] = {}
+        symbol_close_by_ts: Dict[str, Dict[pd.Timestamp, float]] = {}
+        symbol_idx_by_ts: Dict[str, Dict[pd.Timestamp, int]] = {}
+        for sym in valid_symbols:
+            df = normalized_bar_data.get(sym)
+            if df is None or df.empty:
+                continue
+            ts_col = pd.to_datetime(df["open_time"])
+            row_map: Dict[pd.Timestamp, pd.Series] = {}
+            close_map: Dict[pd.Timestamp, float] = {}
+            idx_map: Dict[pd.Timestamp, int] = {}
+            for idx, (ts, row) in enumerate(zip(ts_col.tolist(), df.itertuples(index=False))):
+                tsv = pd.to_datetime(ts)
+                row_s = pd.Series(row._asdict())
+                row_map[tsv] = row_s
+                close_map[tsv] = float(row_s.get("close", 0.0))
+                idx_map[tsv] = idx
+            symbol_row_by_ts[sym] = row_map
+            symbol_close_by_ts[sym] = close_map
+            symbol_idx_by_ts[sym] = idx_map
+
+        # Incremental rolling window cache: symbol -> list of recent row indices
+        rolling_window_bars = max(1, int(self.config.rolling_window_bars or 1))
+        rolling_idx_cache: Dict[str, List[int]] = {sym: [] for sym in valid_symbols}
         
         calculators = calculators or []
         factor_weights: Dict[datetime, Dict[str, float]] = {}
         next_returns: Dict[datetime, Dict[str, float]] = {}
+
+        checkpoint_payload = self._load_checkpoint()
+        last_ts = None
+        if checkpoint_payload and checkpoint_payload.get("last_timestamp"):
+            last_ts = pd.to_datetime(checkpoint_payload["last_timestamp"])
+            timestamps = [ts for ts in timestamps if pd.to_datetime(ts) > last_ts]
+            if verbose:
+                logger.info(f"Incremental mode: resume after {last_ts}, remaining timestamps={len(timestamps)}")
         
         for i, timestamp in enumerate(timestamps):
             if i % 100 == 0 and verbose:
                 logger.info(f"Progress: {i}/{len(timestamps)} ({i*100/len(timestamps):.1f}%)")
             
+            ts = pd.to_datetime(timestamp)
             current_bar_data = {}
+            view_bar_data = {}
             for sym in valid_symbols:
-                if sym in bar_data and 'open_time' in bar_data[sym].columns:
-                    df = bar_data[sym][bar_data[sym]['open_time'] == timestamp]
-                    if not df.empty:
-                        current_bar_data[sym] = df.iloc[0]
+                row_map = symbol_row_by_ts.get(sym, {})
+                row = row_map.get(ts)
+                if row is None:
+                    continue
+                current_bar_data[sym] = row
+                df = normalized_bar_data[sym]
+                idx_map = symbol_idx_by_ts.get(sym, {})
+                idx = idx_map.get(ts)
+                if idx is None:
+                    continue
+
+                if rolling_window_bars > 1:
+                    cache = rolling_idx_cache[sym]
+                    if not cache or idx > cache[-1]:
+                        cache.append(idx)
+                    else:
+                        cache = [x for x in cache if x < idx]
+                        cache.append(idx)
+                    if len(cache) > rolling_window_bars:
+                        del cache[:-rolling_window_bars]
+                    view_bar_data[sym] = df.iloc[cache].copy()
+                else:
+                    view_bar_data[sym] = df.iloc[[idx]].copy()
             
             if not current_bar_data:
                 continue
             
             view = AlphaDataView(
-                bar_data={sym: df[df['open_time'] == timestamp] for sym, df in bar_data.items() if sym in valid_symbols},
+                bar_data=view_bar_data,
                 tran_stats={},
                 symbols=set(valid_symbols),
                 copy_on_read=False
             )
-            
+
+            should_execute = self._is_execution_time(ts)
             raw_weights = {}
-            for calc in calculators:
-                calc_weights = calc.run(view)
-                for sym, w in calc_weights.items():
-                    if sym in valid_symbols:
-                        raw_weights[sym] = raw_weights.get(sym, 0.0) + w
+            if should_execute:
+                # In increment mode, reuse saved alpha snapshot when present.
+                if self.config.run_mode == "increment" and self._alpha_snapshot_exists(ts):
+                    raw_weights = self._load_alpha_snapshot(ts)
+                else:
+                    for calc in calculators:
+                        calc_weights = calc.run(view)
+                        for sym, w in calc_weights.items():
+                            if sym in valid_symbols:
+                                raw_weights[sym] = raw_weights.get(sym, 0.0) + w
+                    self._save_alpha_snapshot(raw_weights, ts)
             
             factor_weights[timestamp] = raw_weights.copy()
             
@@ -283,22 +524,27 @@ class MultiFactorBacktest:
             
             next_ts_idx = i + 1
             if next_ts_idx < len(timestamps):
-                next_ts = timestamps[next_ts_idx]
-                next_bar_data = {}
+                next_ts = pd.to_datetime(timestamps[next_ts_idx])
                 for sym in valid_symbols:
-                    if sym in bar_data and 'open_time' in bar_data[sym].columns:
-                        df = bar_data[sym][bar_data[sym]['open_time'] == next_ts]
-                        if not df.empty:
-                            curr = current_bar_data.get(sym, {})
-                            next_row = df.iloc[0]
-                            if curr:
-                                curr_close = curr.get('close', 0)
-                                next_close = next_row.get('close', 0)
-                                if curr_close > 0:
-                                    ret = (next_close - curr_close) / curr_close
-                                    next_returns[timestamp] = next_returns.get(timestamp, {})
-                                    next_returns[timestamp][sym] = ret
+                    curr = current_bar_data.get(sym, {})
+                    curr_close = curr.get("close", 0) if curr is not None else 0
+                    next_close = symbol_close_by_ts.get(sym, {}).get(next_ts, 0)
+                    if curr_close and next_close and curr_close > 0:
+                        ret = (next_close - curr_close) / curr_close
+                        next_returns[timestamp] = next_returns.get(timestamp, {})
+                        next_returns[timestamp][sym] = ret
+
+            if self.config.enable_incremental:
+                self._checkpoint_steps += 1
+                if self._checkpoint_steps % max(1, int(self.config.checkpoint_every_n_steps)) == 0:
+                    self._save_checkpoint(pd.to_datetime(timestamp))
         
+        self.factor_weights = factor_weights
+        self.next_returns = next_returns
+        if self.config.enable_incremental:
+            final_ts = pd.to_datetime(timestamps[-1]) if timestamps else (last_ts if last_ts is not None else None)
+            self._save_checkpoint(final_ts)
+
         metrics = self._calculate_metrics()
         portfolio_df = pd.DataFrame(self.portfolio_history)
         
@@ -339,6 +585,13 @@ class MultiFactorBacktest:
             long_count=self.config.long_count,
             short_count=self.config.short_count,
             interval=self.config.interval,
+            universe_version=self.config.universe_version,
+            run_mode=self.config.run_mode,
+            enable_incremental=self.config.enable_incremental,
+            checkpoint_dir=self.config.checkpoint_dir,
+            checkpoint_every_n_steps=self.config.checkpoint_every_n_steps,
+            execution_time_labels=self.config.execution_time_labels,
+            rolling_window_bars=self.config.rolling_window_bars,
         )
 
         trades = []
@@ -749,6 +1002,13 @@ def run_single_calculator_backtest(
         long_count=config.long_count,
         short_count=config.short_count,
         interval=config.interval,
+        universe_version=config.universe_version,
+        run_mode=config.run_mode,
+        enable_incremental=config.enable_incremental,
+        checkpoint_dir=config.checkpoint_dir,
+        checkpoint_every_n_steps=config.checkpoint_every_n_steps,
+        execution_time_labels=config.execution_time_labels,
+        rolling_window_bars=config.rolling_window_bars,
     )
     result = create_backtest_result(
         config=result_config,
@@ -895,6 +1155,14 @@ def run_backtest(
     capital_allocation: str = "rank_weight",
     long_count: int = 5,
     short_count: int = 5,
+    run_mode: str = "complete",
+    enable_incremental: bool = False,
+    checkpoint_dir: Optional[str] = None,
+    checkpoint_every_n_steps: int = 50,
+    execution_time_labels: Optional[List[str]] = None,
+    rolling_window_bars: int = 1,
+    save_alpha: bool = False,
+    alpha_output_dir: Optional[str] = None,
     verbose: bool = True,
 ) -> BacktestResult:
     """
@@ -920,6 +1188,14 @@ def run_backtest(
         capital_allocation=capital_allocation,
         long_count=long_count,
         short_count=short_count,
+        run_mode=run_mode,
+        enable_incremental=enable_incremental,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_every_n_steps=checkpoint_every_n_steps,
+        execution_time_labels=execution_time_labels,
+        rolling_window_bars=rolling_window_bars,
+        save_alpha=save_alpha,
+        alpha_output_dir=alpha_output_dir,
     )
     
     backtest = MultiFactorBacktest(config)

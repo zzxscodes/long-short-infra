@@ -9,6 +9,7 @@ from pathlib import Path
 import uuid
 import logging
 import time
+import json
 
 import pandas as pd
 import numpy as np
@@ -40,6 +41,7 @@ from ..execution.execution_method_selector import (
     METHOD_VWAP,
     METHOD_CANCEL_ALL_ORDERS,
 )
+from .result_saver import BacktestResultSaver
 
 logger = logging.getLogger('backtest_executor')
 
@@ -125,8 +127,146 @@ class BacktestExecutor:
 
         # Trade sync cursor (avoid duplicate sync)
         self._synced_trade_count: int = 0
+        self._checkpoint_steps: int = 0
 
         logger.info(f"Initialized BacktestExecutor: {config.name}, balance={config.initial_balance}")
+
+    def _get_checkpoint_path(self) -> Optional[Path]:
+        if not getattr(self.config, "enable_incremental", False):
+            return None
+        root = Path(self.config.checkpoint_dir) if getattr(self.config, "checkpoint_dir", None) else Path("data/backtest_results/checkpoints")
+        root.mkdir(parents=True, exist_ok=True)
+        return root / f"{self.config.name}.executor.checkpoint.json"
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, (datetime, pd.Timestamp)):
+            return value.isoformat()
+        if isinstance(value, (np.integer, np.int64)):
+            return int(value)
+        if isinstance(value, (np.floating, np.float64)):
+            return float(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+    def _save_checkpoint(self, last_timestamp: Optional[datetime]) -> None:
+        path = self._get_checkpoint_path()
+        if path is None:
+            return
+        payload = {
+            "last_timestamp": last_timestamp.isoformat() if last_timestamp else None,
+            "portfolio_history": [
+                {
+                    "timestamp": s.timestamp,
+                    "total_balance": s.total_balance,
+                    "available_balance": s.available_balance,
+                    "used_margin": s.used_margin,
+                    "total_pnl": s.total_pnl,
+                    "realized_pnl": s.realized_pnl,
+                    "unrealized_pnl": s.unrealized_pnl,
+                    "trades_count": s.trades_count,
+                    "commission_paid": s.commission_paid,
+                }
+                for s in self.portfolio_history
+            ],
+            "backtest_trades": [
+                {
+                    "trade_id": t.trade_id,
+                    "symbol": t.symbol,
+                    "side": t.side.value,
+                    "quantity": t.quantity,
+                    "price": t.price,
+                    "executed_at": t.executed_at,
+                    "commission": t.commission,
+                    "pnl": t.pnl,
+                }
+                for t in self.backtest_trades
+            ],
+            "order_engine": {
+                "balance": self.order_engine.balance,
+                "positions": dict(self.order_engine.positions),
+                "synced_trade_count": self._synced_trade_count,
+            },
+            "scheduled_orders": self._scheduled_orders,
+            "stop_trading": self._stop_trading,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, default=self._json_default), encoding="utf-8")
+
+    def _load_checkpoint(self) -> Optional[datetime]:
+        path = self._get_checkpoint_path()
+        if path is None or (not path.exists()):
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.portfolio_history = []
+            for row in payload.get("portfolio_history", []):
+                self.portfolio_history.append(
+                    PortfolioState(
+                        timestamp=pd.to_datetime(row.get("timestamp")),
+                        total_balance=float(row.get("total_balance", self.config.initial_balance)),
+                        available_balance=float(row.get("available_balance", self.config.initial_balance)),
+                        used_margin=float(row.get("used_margin", 0.0)),
+                        total_pnl=float(row.get("total_pnl", 0.0)),
+                        realized_pnl=float(row.get("realized_pnl", 0.0)),
+                        unrealized_pnl=float(row.get("unrealized_pnl", 0.0)),
+                        trades_count=int(row.get("trades_count", 0)),
+                        commission_paid=float(row.get("commission_paid", 0.0)),
+                    )
+                )
+
+            self.backtest_trades = []
+            for t in payload.get("backtest_trades", []):
+                self.backtest_trades.append(
+                    Trade(
+                        trade_id=t.get("trade_id", ""),
+                        symbol=t.get("symbol", ""),
+                        side=OrderSide(t.get("side", OrderSide.LONG.value)),
+                        quantity=float(t.get("quantity", 0.0)),
+                        price=float(t.get("price", 0.0)),
+                        executed_at=pd.to_datetime(t.get("executed_at")).to_pydatetime(),
+                        commission=float(t.get("commission", 0.0)),
+                        pnl=float(t.get("pnl", 0.0)),
+                    )
+                )
+
+            oe = payload.get("order_engine", {})
+            self.order_engine.balance = float(oe.get("balance", self.config.initial_balance))
+            self.order_engine.positions.clear()
+            for symbol, pos in oe.get("positions", {}).items():
+                self.order_engine.positions[symbol] = {
+                    "quantity": float(pos.get("quantity", 0.0)),
+                    "entry_price": float(pos.get("entry_price", 0.0)),
+                    "realized_pnl": float(pos.get("realized_pnl", 0.0)),
+                    "commission": float(pos.get("commission", 0.0)),
+                }
+            self._synced_trade_count = int(oe.get("synced_trade_count", 0))
+            self._scheduled_orders = list(payload.get("scheduled_orders", []))
+            for order in self._scheduled_orders:
+                if isinstance(order, dict) and order.get("execute_at"):
+                    order["execute_at"] = pd.to_datetime(order["execute_at"]).to_pydatetime()
+            self._stop_trading = bool(payload.get("stop_trading", False))
+
+            last = payload.get("last_timestamp")
+            return pd.to_datetime(last).to_pydatetime() if last else None
+        except Exception as e:
+            logger.warning(f"Failed to load executor checkpoint: {e}", exc_info=True)
+            return None
+
+    def _format_time_label(self, timestamp: datetime) -> str:
+        ts = pd.to_datetime(timestamp).to_pydatetime()
+        interval = str(getattr(self.config, "interval", "5m")).lower().strip()
+        minutes = 5
+        if interval.endswith("m"):
+            minutes = max(1, int(interval[:-1]))
+        elif interval.endswith("h"):
+            minutes = max(1, int(interval[:-1]) * 60)
+        label = int((ts.hour * 60 + ts.minute) // minutes) + 1
+        return str(label).zfill(3)
+
+    def _is_execution_time(self, timestamp: datetime) -> bool:
+        labels = getattr(self.config, "execution_time_labels", None)
+        if not labels:
+            return True
+        return self._format_time_label(timestamp) in set(labels)
 
     def _init_symbols(self):
         """初始化交易所信息"""
@@ -174,10 +314,18 @@ class BacktestExecutor:
 
         self.portfolio_history = []
         self.backtest_trades = []
+        self._scheduled_orders = []
+        self._stop_trading = False
+
+        resume_after = None
+        if getattr(self.config, "enable_incremental", False) or getattr(self.config, "run_mode", "complete") == "increment":
+            resume_after = self._load_checkpoint()
+            if verbose and resume_after is not None:
+                logger.info(f"Incremental mode: resume from {resume_after.isoformat()}")
 
         step_count = 0
         try:
-            for timestamp, klines_snapshot in self.replay_engine.replay_iterator():
+            for timestamp, klines_snapshot in self.replay_engine.replay_iterator(start_after=resume_after):
                 self._current_timestamp = timestamp
                 self._update_prices(klines_snapshot)
 
@@ -189,11 +337,23 @@ class BacktestExecutor:
 
                 portfolio_state = self._get_portfolio_state()
 
-                try:
-                    target_weights = strategy_func(portfolio_state, klines_snapshot)
-                except Exception as e:
-                    logger.error(f"Strategy error at {timestamp}: {e}", exc_info=True)
-                    target_weights = {}
+                target_weights = {}
+                if self._is_execution_time(timestamp):
+                    try:
+                        rolling_window_bars = int(getattr(self.config, "rolling_window_bars", 0) or 0)
+                        if rolling_window_bars > 0:
+                            # Backward-compatible extension:
+                            # if strategy accepts 3 args, provide rolling window snapshots.
+                            try:
+                                rolling_snapshot = self.replay_engine.get_rolling_window_snapshot(timestamp, rolling_window_bars)
+                                target_weights = strategy_func(portfolio_state, klines_snapshot, rolling_snapshot)
+                            except TypeError:
+                                target_weights = strategy_func(portfolio_state, klines_snapshot)
+                        else:
+                            target_weights = strategy_func(portfolio_state, klines_snapshot)
+                    except Exception as e:
+                        logger.error(f"Strategy error at {timestamp}: {e}", exc_info=True)
+                        target_weights = {}
 
                 if (not self._stop_trading) and target_weights:
                     self._execute_target_positions(target_weights, portfolio_state)
@@ -218,6 +378,11 @@ class BacktestExecutor:
                     pass
 
                 step_count += 1
+                if getattr(self.config, "enable_incremental", False):
+                    self._checkpoint_steps += 1
+                    every_n = max(1, int(getattr(self.config, "checkpoint_every_n_steps", 100)))
+                    if self._checkpoint_steps % every_n == 0:
+                        self._save_checkpoint(pd.to_datetime(timestamp).to_pydatetime())
                 progress_interval = get_progress_log_interval()
                 if verbose and step_count % progress_interval == 0:
                     logger.info(f"Progress: {step_count} steps, {timestamp}")
@@ -227,6 +392,8 @@ class BacktestExecutor:
             raise
 
         self._close_all_positions()
+        if getattr(self.config, "enable_incremental", False):
+            self._save_checkpoint(self._current_timestamp)
 
         end_time = time.time()
         end_datetime = datetime.now(timezone.utc)
@@ -953,6 +1120,11 @@ class FactorBacktestExecutor:
                 capital_allocation=getattr(config, 'capital_allocation', 'equal_weight'),
                 long_count=getattr(config, 'long_count', 10),
                 short_count=getattr(config, 'short_count', 10),
+                run_mode=getattr(config, 'run_mode', 'complete'),
+                enable_incremental=getattr(config, 'enable_incremental', False),
+                checkpoint_dir=getattr(config, 'checkpoint_dir', None),
+                checkpoint_every_n_steps=getattr(config, 'checkpoint_every_n_steps', 100),
+                execution_time_labels=getattr(config, 'execution_time_labels', None),
             )
         else:
             bt_config = config
@@ -989,6 +1161,11 @@ def run_backtest(
     long_count: int = 5,
     short_count: int = 5,
     leverage: Optional[float] = None,
+    run_mode: str = "complete",
+    enable_incremental: bool = False,
+    checkpoint_dir: Optional[str] = None,
+    checkpoint_every_n_steps: int = 100,
+    execution_time_labels: Optional[List[str]] = None,
     verbose: bool = True,
 ) -> BacktestResult:
     """
@@ -1017,6 +1194,11 @@ def run_backtest(
         long_count=long_count,
         short_count=short_count,
         leverage=leverage,
+        run_mode=run_mode,
+        enable_incremental=enable_incremental,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_every_n_steps=checkpoint_every_n_steps,
+        execution_time_labels=execution_time_labels,
     )
 
     replay_engine = DataReplayEngine(
@@ -1035,6 +1217,11 @@ def run_backtest(
             symbols=config.symbols or ["BTCUSDT", "ETHUSDT"],
             leverage=config.leverage,
             interval=config.interval or get_default_interval(),
+            run_mode=getattr(config, 'run_mode', 'complete'),
+            enable_incremental=getattr(config, 'enable_incremental', False),
+            checkpoint_dir=getattr(config, 'checkpoint_dir', None),
+            checkpoint_every_n_steps=getattr(config, 'checkpoint_every_n_steps', 100),
+            execution_time_labels=getattr(config, 'execution_time_labels', None),
         ),
         replay_engine=replay_engine
     )

@@ -53,6 +53,13 @@ class BacktestConfig:
     min_weight: float = 0.02
     max_weight: float = 0.2
     interval: str = field(default_factory=get_default_interval)
+    universe_version: str = "v1"
+    run_mode: str = "complete"
+    enable_incremental: bool = False
+    checkpoint_dir: Optional[str] = None
+    checkpoint_every_n_steps: int = 100
+    execution_time_labels: Optional[List[str]] = None
+    rolling_window_bars: int = 0
 
 
 @dataclass
