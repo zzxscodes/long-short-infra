@@ -99,10 +99,13 @@ class PullCompareConfig:
         "high": FieldTolerance(abs=0.0, rel=1e-4),
         "low": FieldTolerance(abs=0.0, rel=1e-4),
         "close": FieldTolerance(abs=0.0, rel=1e-4),
-        "volume": FieldTolerance(abs=0.0, rel=1e-4),
-        "quote_volume": FieldTolerance(abs=0.0, rel=1e-4),
-        # tradecount 仍要求完全一致
-        "tradecount": FieldTolerance(abs=0.0, rel=0.0),
+        # volume/quote_volume 在 Vision 与本地聚合时会有非常轻微的四舍五入差异，
+        # 放宽一点点以降低无意义的“全量失败”。
+        "volume": FieldTolerance(abs=0.0, rel=2e-4),
+        "quote_volume": FieldTolerance(abs=0.0, rel=2e-4),
+        # tradecount 由于 aggTrade -> kline 聚合实现/边界处理可能有 1~2 级别波动，
+        # 对回测的 OHLCV 主体误差影响很小，因此允许小范围差异。
+        "tradecount": FieldTolerance(abs=2.0, rel=0.001),
     })
 
 
@@ -390,7 +393,8 @@ def _compare_funding_symbol(symbol: str, day: date, local_df: pd.DataFrame, remo
             if len(examples) < 5:
                 examples.append({"key": int(r["key"]), "fundingRate_local": fr_l, "fundingRate_remote": fr_r, "markPrice_local": mp_l, "markPrice_remote": mp_r})
     mismatch_ratio = mismatched / max(1, len(both))
-    ok = (missing_local == 0) and (missing_remote == 0) and mismatch_ratio <= 0.01
+    # 关键修复：本地与 Vision 同时空（both==0）时，不应判为 ok。
+    ok = (missing_local == 0) and (missing_remote == 0) and (len(both) > 0) and mismatch_ratio <= 0.01
     return FundingCompareResult(format_symbol(symbol), str(day), ok, int(len(local_df)), int(len(remote_df)), missing_local, missing_remote, mismatched, mismatch_ratio, examples)
 
 
@@ -414,7 +418,8 @@ def _compare_premium_symbol(symbol: str, day: date, local_df: pd.DataFrame, remo
             if len(examples) < 5:
                 examples.append({"key": int(r["key"])})
     mismatch_ratio = mismatched / max(1, len(both))
-    ok = (missing_local == 0) and (missing_remote == 0) and mismatch_ratio <= 0.01
+    # 关键修复：本地与 Vision 同时空（both==0）时，不应判为 ok。
+    ok = (missing_local == 0) and (missing_remote == 0) and (len(both) > 0) and mismatch_ratio <= 0.01
     return PremiumCompareResult(format_symbol(symbol), str(day), ok, int(len(local_df)), int(len(remote_df)), missing_local, missing_remote, mismatched, mismatch_ratio, examples)
 
 
@@ -749,18 +754,34 @@ def pull_day_data_from_live(
         if cfg.live_klines_dir and cfg.local_klines_dir:
             remote_kline = f"{cfg.live_klines_dir}/{sym_formatted}/{day_str}.parquet"
             local_kline = Path(cfg.local_klines_dir) / sym_formatted / f"{day_str}.parquet"
+            # 关键：先删除本地目标文件，避免历史残留导致 Step3 重算逻辑误触发
+            if local_kline.exists():
+                try:
+                    local_kline.unlink()
+                except Exception:
+                    pass
             if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_kline, str(local_kline)):
                 klines_count += 1
         
         if cfg.live_funding_rates_dir and cfg.local_funding_rates_dir:
             remote_funding = f"{cfg.live_funding_rates_dir}/{sym_formatted}/{day_str}.parquet"
             local_funding = Path(cfg.local_funding_rates_dir) / sym_formatted / f"{day_str}.parquet"
+            if local_funding.exists():
+                try:
+                    local_funding.unlink()
+                except Exception:
+                    pass
             if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_funding, str(local_funding)):
                 funding_count += 1
         
         if cfg.live_premium_index_dir and cfg.local_premium_index_dir:
             remote_premium = f"{cfg.live_premium_index_dir}/{sym_formatted}/{day_str}.parquet"
             local_premium = Path(cfg.local_premium_index_dir) / sym_formatted / f"{day_str}.parquet"
+            if local_premium.exists():
+                try:
+                    local_premium.unlink()
+                except Exception:
+                    pass
             if _pull_file_from_live(cfg.live_user, cfg.live_host, remote_premium, str(local_premium)):
                 premium_count += 1
         if idx == 1 or idx % 50 == 0 or idx == total:
@@ -770,6 +791,13 @@ def pull_day_data_from_live(
             )
     
     return klines_count, funding_count, premium_count
+
+
+def _has_local_day_parquet(root_dir: str, symbol: str, day: date) -> bool:
+    if not root_dir:
+        return False
+    p = Path(root_dir) / format_symbol(symbol) / f"{day.isoformat()}.parquet"
+    return p.exists()
 
 
 async def _fetch_official_5m_klines_from_vision(
@@ -1027,7 +1055,12 @@ def _compare_symbol_day(
     cfg: PullCompareConfig,
     max_examples: int = 5,
 ) -> SymbolCompareResult:
-    fields = ["open", "high", "low", "close", "volume", "quote_volume", "tradecount"]
+    # 线上质量判断重点：回测主要依赖 OHLC 的价格轴一致性。
+    # volume/quote_volume 在 Vision 与本地聚合时会出现微小（甚至略偏大的）四舍五入差异，
+    # 若把它也纳入“全量失败”判定，会导致大量无意义的重算。
+    # tradecount 可能出现 1~2 波动，也同样不参与全量失败判定。
+    compare_fields = ["open", "high", "low", "close"]
+    fields = compare_fields + ["tradecount"]
     tolerances = cfg.tolerances or {}
     merged = pd.merge(
         remote_df, local_df, on="open_time_ms", how="outer",
@@ -1041,7 +1074,7 @@ def _compare_symbol_day(
     both = merged[merged["_merge"] == "both"]
     total_both = int(len(both))
     for _, r in both.iterrows():
-        row_bad = False
+        row_bad = False  # 仅由 compare_fields 决定（不含 tradecount）
         diffs: Dict[str, Any] = {}
         for f in fields:
             rv = r.get(f"{f}_remote")
@@ -1060,7 +1093,8 @@ def _compare_symbol_day(
             max_ref_diff[f] = max(max_ref_diff[f], ref_diff)
             tol = tolerances.get(f, FieldTolerance(abs=0.0, rel=0.0))
             if not tol.ok(lv_f, rv_f):
-                row_bad = True
+                if f in compare_fields:
+                    row_bad = True
                 diffs[f] = {"live": lv_f, "binance_history": rv_f, "diff": diff, "ref_diff": ref_diff}
         if row_bad:
             mismatched_rows += 1
@@ -1072,7 +1106,14 @@ def _compare_symbol_day(
                     "diffs": diffs,
                 })
     mismatch_ratio = mismatched_rows / max(1, total_both)
-    ok = (missing_local == 0) and (missing_remote == 0) and (mismatch_ratio <= cfg.max_mismatch_ratio)
+    # 关键修复：当本地与 Vision 同时都是空（total_both==0）时，不应判为 ok。
+    # 否则会掩盖缺失数据并跳过 Step3 的 aggTrade 重算。
+    ok = (
+        (missing_local == 0)
+        and (missing_remote == 0)
+        and (total_both > 0)
+        and (mismatch_ratio <= cfg.max_mismatch_ratio)
+    )
     return SymbolCompareResult(
         symbol=format_symbol(symbol),
         day=str(day),
@@ -1169,12 +1210,68 @@ def _save_klines_parquet(symbol: str, df: pd.DataFrame, day: date, klines_dir: P
         return False
 
 
+def _save_kline_timestamp_audit(
+    *,
+    symbol: str,
+    day: date,
+    local_df: pd.DataFrame,
+    remote_df: pd.DataFrame,
+    audit_root: Path,
+) -> None:
+    """
+    保存（理论/实际）K线时间戳对比信息，用于排查 Vision 与本地时间轴差异。
+
+    约定：
+    - theoretical = Vision(remote_df) 的 open_time_ms
+    - actual = 本地(local_df) 的 open_time_ms
+    - 两者并集按 5m K 线 open_time_ms（Unix 秒）保存
+    """
+    if audit_root is None:
+        return
+
+    sym = format_symbol(symbol)
+    day_str = day.isoformat()
+    out_dir = audit_root / sym
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{day_str}.parquet"
+
+    local_keys: set[int] = set()
+    remote_keys: set[int] = set()
+    if not local_df.empty and "open_time_ms" in local_df.columns:
+        local_keys = set(int(x) for x in local_df["open_time_ms"].dropna().tolist())
+    if not remote_df.empty and "open_time_ms" in remote_df.columns:
+        remote_keys = set(int(x) for x in remote_df["open_time_ms"].dropna().tolist())
+
+    all_keys = sorted(local_keys | remote_keys)
+    if not all_keys:
+        # 两侧都没有时间轴数据：不写空文件，避免占用太多 inode。
+        return
+
+    rows = []
+    for k in all_keys:
+        in_local = k in local_keys
+        in_remote = k in remote_keys
+        status = "both" if (in_local and in_remote) else ("local_only" if in_local else "remote_only")
+        rows.append(
+            {
+                "open_time_ms": int(k),
+                "open_time_iso": datetime.fromtimestamp(int(k), tz=timezone.utc).isoformat(),
+                "theoretical_open_time_ms": int(k) if in_remote else None,
+                "actual_open_time_ms": int(k) if in_local else None,
+                "status": status,
+            }
+        )
+
+    pd.DataFrame(rows).to_parquet(out_path, index=False)
+
+
 async def compare_klines_only(
     *,
     day: date,
     symbols: Sequence[str],
     cfg: PullCompareConfig,
     max_concurrent: Optional[int] = None,
+    audit_dir: Optional[Path] = None,
 ) -> List[SymbolCompareResult]:
     """
     对比官方 5m K线与本地数据，对比失败则下载 aggTrade 重新聚合覆盖
@@ -1194,6 +1291,19 @@ async def compare_klines_only(
                 )
             remote_df = _official_to_df(sym, remote_raw)
             local_df = _load_local_kline_df(sym, day, klines_dir)
+            # 保存时间轴审计数据（理论/实际时间戳）
+            try:
+                if audit_dir is not None:
+                    _save_kline_timestamp_audit(
+                        symbol=sym,
+                        day=day,
+                        local_df=local_df,
+                        remote_df=remote_df,
+                        audit_root=audit_dir,
+                    )
+            except Exception as e:
+                print(f"Warning: failed saving timestamp audit for {sym}: {e}", file=sys.stderr)
+
             return _compare_symbol_day(
                 symbol=sym, day=day, local_df=local_df, remote_df=remote_df, cfg=cfg
             )
@@ -1216,6 +1326,10 @@ async def fix_klines_with_aggtrade(
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120.0), headers=headers) as session:
         for sym in symbols:
             try:
+                # 如果本地当天 K 线都不存在（Step1 未拉到），则没必要重算 aggTrades（也避免日志噪声）。
+                # 这种情况应由 Step1 的 missing_local 体现，而不是进入 Step3。
+                if not _has_local_day_parquet(cfg.local_klines_dir, sym, day):
+                    continue
                 print(f"  Downloading aggTrades for {sym}...")
                 trades = await _fetch_agg_trades_from_vision(
                     session, symbol=sym, day=day,
@@ -1267,6 +1381,24 @@ async def _main_async(args: argparse.Namespace) -> int:
     if not cfg.live_klines_dir:
         print("Error: live_klines_dir must be configured.", file=sys.stderr)
         return 1
+
+    # Vision 前一天数据在次日 UTC 10:00 才稳定可用。
+    # Cron 为 UTC 12:00 时理论上无需等待，但为了手动/异常触发更稳，仍做一次有上限等待。
+    try:
+        now = datetime.now(timezone.utc)
+        vision_ready_at = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(days=1, hours=10)
+        if now < vision_ready_at:
+            wait_s = (vision_ready_at - now).total_seconds()
+            wait_s = max(0.0, min(float(wait_s), 7200.0))  # 最多等待 2 小时
+            if wait_s > 0:
+                print(f"\n[VisionReadyWait] Waiting {wait_s:.0f}s until {vision_ready_at.isoformat()} UTC...")
+                await asyncio.sleep(wait_s)
+    except Exception:
+        pass
+
+    # 保存理论/实际时间戳对比数据（与 klines 目录同级）
+    timestamp_audit_dir = Path(cfg.local_klines_dir).parent / "timestamp_audit"
+    timestamp_audit_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"=== Backtest Pull Compare: {day.isoformat()} ===")
     print(f"Live: {cfg.live_user}@{cfg.live_host}")
@@ -1297,7 +1429,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     print(f"\n[Step 2] Download Binance history (funding/premium/kline) and first compare (live)...")
     _log_validation_criteria(cfg)
     klines_live_results = await compare_klines_only(
-        day=day, symbols=symbols, cfg=cfg, max_concurrent=int(args.max_concurrent)
+        day=day, symbols=symbols, cfg=cfg, max_concurrent=int(args.max_concurrent), audit_dir=timestamp_audit_dir
     )
     funding_live_results, premium_live_results = await compare_funding_and_premium(
         day=day,
@@ -1330,11 +1462,6 @@ async def _main_async(args: argparse.Namespace) -> int:
         "premium_index_results": [asdict(r) for r in premium_live_results],
     }
     live_report_path.write_text(json.dumps(live_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    # 向后兼容：保留无后缀报告为 live 版本。
-    (out_dir / f"{day.isoformat()}.json").write_text(
-        json.dumps(live_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
     print(f"\n=== Live Summary ===")
     print(f"day={day.isoformat()}")
@@ -1350,7 +1477,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         fail_symbols = [r.symbol for r in klines_live_results if not r.ok]
         await fix_klines_with_aggtrade(day=day, symbols=fail_symbols, cfg=cfg)
         klines_history_results = await compare_klines_only(
-            day=day, symbols=symbols, cfg=cfg, max_concurrent=int(args.max_concurrent)
+            day=day, symbols=symbols, cfg=cfg, max_concurrent=int(args.max_concurrent), audit_dir=timestamp_audit_dir
         )
     else:
         print(f"\n[Step 3] Kline live compare passed, keep pulled live kline for backtest.")

@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import sys
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
@@ -17,6 +18,8 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+DEFAULT_PID_PATH = PROJECT_ROOT / "logs" / "prepare_backtest_history.pid"
 
 from src.common.config import config
 from src.common.utils import ensure_directory, format_symbol
@@ -159,6 +162,17 @@ async def _prepare_one_day(
         universe_csv = _save_universe_csv(Path(cfg.local_universe_dir), day, universe_symbols)
         print(f"[{day}] universe generated: {len(universe_symbols)} symbols -> {universe_csv}")
 
+        # 关键：每次生成某一天的回测数据前，清掉本地同一天可能残留的文件。
+        # 避免历史残留导致：即使本次网络下载失败，仍拿到旧数据参与对比/通过判断。
+        local_klines_dir = Path(cfg.local_klines_dir)
+        local_funding_dir = Path(cfg.local_funding_rates_dir)
+        local_premium_dir = Path(cfg.local_premium_index_dir)
+        for sym in universe_symbols:
+            s = format_symbol(sym)
+            (local_klines_dir / s / f"{day.isoformat()}.parquet").unlink(missing_ok=True)
+            (local_funding_dir / s / f"{day.isoformat()}.parquet").unlink(missing_ok=True)
+            (local_premium_dir / s / f"{day.isoformat()}.parquet").unlink(missing_ok=True)
+
         results = []
 
         async def prepare_symbol(sym: str) -> None:
@@ -251,6 +265,13 @@ async def _main_async(args: argparse.Namespace) -> int:
     start_day = _parse_day(args.start_day)
     end_day = _parse_day(args.end_day)
     days = _iter_days(start_day, end_day)
+
+    # 写入 PID（cron/nohup 都适用），便于排查/停止任务
+    try:
+        DEFAULT_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_PID_PATH.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except Exception:
+        pass
 
     cfg = PullCompareConfig(
         live_host=str(config.get("data.backtest_pull_live_host", "")),
