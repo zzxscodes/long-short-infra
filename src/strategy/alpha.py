@@ -38,6 +38,10 @@ class AlphaResult:
 
     weights: Dict[str, float]  # 系统交易对符号 -> 权重
     per_calculator: Dict[str, Dict[str, float]]  # 计算器名称 -> 权重字典
+    # 与回测/对账对齐的快照标签（与 DataAPI.get_bar_between 一致）
+    begin_label: Optional[str] = None
+    end_label: Optional[str] = None
+    mode: str = "5min"
 
 
 class AlphaEngine:
@@ -101,6 +105,8 @@ class AlphaEngine:
         history_days: Optional[int] = None,
         mode: str = "5min",
         end_time: Optional[datetime] = None,
+        begin_label: Optional[str] = None,
+        end_label: Optional[str] = None,
     ) -> AlphaDataView:
         """
         为alpha获取一致的数据快照。
@@ -109,7 +115,8 @@ class AlphaEngine:
         如果声明了修改行为，该实例将强制执行读时复制。
         """
         history_days = self.history_days if history_days is None else int(history_days)
-        begin_label, end_label = self._get_labels(history_days, end_time=end_time)
+        if begin_label is None or end_label is None:
+            begin_label, end_label = self._get_labels(history_days, end_time=end_time)
 
         logger.info(f"Fetching snapshot: {history_days}d, mode={mode}, {begin_label} -> {end_label}")
         
@@ -190,10 +197,26 @@ class AlphaEngine:
         """
         运行所有计算器并返回求和后的向量。
         """
-        if not self.calculators:
-            return AlphaResult(weights={}, per_calculator={})
+        history_days = self.history_days if history_days is None else int(history_days)
+        begin_label, end_label = self._get_labels(history_days, end_time=end_time)
 
-        base_view = self.fetch_snapshot(symbols, history_days=history_days, mode=mode, end_time=end_time)
+        if not self.calculators:
+            return AlphaResult(
+                weights={},
+                per_calculator={},
+                begin_label=begin_label,
+                end_label=end_label,
+                mode=mode,
+            )
+
+        base_view = self.fetch_snapshot(
+            symbols,
+            history_days=history_days,
+            mode=mode,
+            end_time=end_time,
+            begin_label=begin_label,
+            end_label=end_label,
+        )
 
         # 串行路径
         if self.concurrency == "none" or len(self.calculators) == 1:
@@ -209,7 +232,15 @@ class AlphaEngine:
                         calc_weight = float(calc_weights.get(calc.name, 1.0))
                         weighted_vectors.append(self._scale_weights(raw_vec, calc_weight))
             weights = self._normalize_weights(self._sum_weights(weighted_vectors))
-            return AlphaResult(weights=weights, per_calculator=per_calc)
+            result = AlphaResult(
+                weights=weights,
+                per_calculator=per_calc,
+                begin_label=begin_label,
+                end_label=end_label,
+                mode=mode,
+            )
+            self._maybe_persist_live(result)
+            return result
 
         # 并发路径
         per_calc = {}
@@ -243,7 +274,30 @@ class AlphaEngine:
         logger.info(f"Alpha calculators completed: {len(self.calculators)} calcs in {dt:.2f}s")
 
         weights = self._normalize_weights(self._sum_weights(weighted_vectors))
-        return AlphaResult(weights=weights, per_calculator=per_calc)
+        result = AlphaResult(
+            weights=weights,
+            per_calculator=per_calc,
+            begin_label=begin_label,
+            end_label=end_label,
+            mode=mode,
+        )
+        self._maybe_persist_live(result)
+        return result
+
+    @staticmethod
+    def _maybe_persist_live(result: AlphaResult) -> None:
+        try:
+            from .alpha_snapshot_io import maybe_persist_live_alpha_snapshot
+
+            maybe_persist_live_alpha_snapshot(
+                weights=result.weights,
+                per_calculator=result.per_calculator,
+                begin_label=result.begin_label,
+                end_label=result.end_label,
+                mode=result.mode,
+            )
+        except Exception:
+            logger.warning("Live alpha snapshot persist skipped", exc_info=True)
 
 
 _alpha_engine: Optional[AlphaEngine] = None

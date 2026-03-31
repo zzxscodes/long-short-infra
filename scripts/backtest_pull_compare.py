@@ -2,15 +2,21 @@
 """
 回测机主动拉取实盘数据并对比
 
+设计约定（与定时任务一致）：
+- 在 **UTC 日历日 D 的 12:00** 执行（见 scripts/setup_backtest_compare_scheduler.py）。
+  此时 **UTC 的「前一」日 D-1** 的历史数据（含 data.binance.vision 日文件等）才视为已就绪，故默认
+  **对比日 target_day = UTC 昨天**（_default_day_utc），即验证的是 **D-1** 这一天的数据。
+- **Universe**：在 local universe 目录下取 **日期目录 <= target_day** 的 **最新** 一份
+  `YYYY-MM-DD/v1/universe.csv`，即与 **「前一 UTC 日」** 被测数据对应的 **universe 体量**
+  （在目录齐全时通常为 **target_day 当日** 的快照；若当日目录尚未落盘，则回退到更早一档）。
+
 工作流程：
-1. 从实盘机器拉取当日 klines/funding_rates/premium_index 数据
+1. 从实盘机器拉取对比日相关 klines/funding_rates/premium_index 数据
 2. 下载 Binance 官方 5m K线（data.binance.vision），与拉取的数据对比
 3. 对比通过：保持拉取的数据不变
 4. 对比不通过：从 data.binance.vision 下载历史 aggTrade，聚合覆盖本地数据
 
 运行环境：回测机（Windows），需要配置到实盘机器的 SSH 访问
-
-建议定时任务：UTC 10:30（data.binance.vision 当日文件已可用）
 """
 
 from __future__ import annotations
@@ -518,6 +524,7 @@ async def compare_funding_and_premium(
 
 
 def _default_day_utc() -> date:
+    """默认对比日：UTC 昨天。配合 UTC 12:00 定时任务，验证「前一 UTC 日」已完整落盘的数据。"""
     now = datetime.now(timezone.utc)
     return (now - timedelta(days=1)).date()
 
@@ -580,7 +587,8 @@ def _load_universe_symbols(
 ) -> list:
     """
     加载 universe symbols。
-    如果指定 target_day，则只加载 <= target_day 的 universe（确保使用历史数据对应的 universe）
+    若指定 target_day（即默认的「UTC 昨天」对比日），只考虑日期目录 <= target_day，
+    并取其中**最新**一档：与「前一 UTC 日」数据对齐的 universe 体量。
     universe_dir: 为 None 时用 config 的 data.universe_directory；否则与 --local-universe-dir 一致。
     """
     base = Path(universe_dir) if universe_dir is not None else Path(
@@ -1402,7 +1410,11 @@ async def _main_async(args: argparse.Namespace) -> int:
     
     print(f"=== Backtest Pull Compare: {day.isoformat()} ===")
     print(f"Live: {cfg.live_user}@{cfg.live_host}")
-    print(f"Target day: {day.isoformat()} (universe must be <= this date)")
+    print(
+        f"Target day: {day.isoformat()} "
+        f"(universe: latest YYYY-MM-DD/v1/universe.csv with date <= this day; "
+        f"aligned with 'previous UTC day' data under test)"
+    )
     
     if args.symbols:
         symbols = [format_symbol(s.strip()) for s in args.symbols.split(",") if s.strip()]

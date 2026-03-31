@@ -1208,6 +1208,10 @@ def run_backtest(
         interval=config.interval or get_default_interval()
     )
 
+    # 与 MultiFactorBacktest 一致：Calculator 需要 bar DataFrame 窗口；replay 单步传入的是 KlineSnapshot
+    rw_cfg = int(getattr(config, "rolling_window_bars", 500) or 0)
+    rolling_window_bars = rw_cfg if rw_cfg > 1 else 500
+
     executor = BacktestExecutor(
         config=BacktestConfig(
             name=config.name,
@@ -1222,17 +1226,43 @@ def run_backtest(
             checkpoint_dir=getattr(config, 'checkpoint_dir', None),
             checkpoint_every_n_steps=getattr(config, 'checkpoint_every_n_steps', 100),
             execution_time_labels=getattr(config, 'execution_time_labels', None),
+            rolling_window_bars=rolling_window_bars,
         ),
         replay_engine=replay_engine
     )
 
-    def strategy_wrapper(portfolio_state, klines):
+    def _snapshots_to_bar_data(klines_snapshot: Dict[str, KlineSnapshot]) -> Dict[str, pd.DataFrame]:
+        """将单根 KlineSnapshot 转为单行 DataFrame，供无滚动窗口时的最小 AlphaDataView。"""
+        out: Dict[str, pd.DataFrame] = {}
+        for sym, snap in klines_snapshot.items():
+            out[sym] = pd.DataFrame(
+                [
+                    {
+                        "open_time": snap.timestamp,
+                        "close_time": snap.timestamp,
+                        "open": snap.open,
+                        "high": snap.high,
+                        "low": snap.low,
+                        "close": snap.close,
+                        "volume": snap.volume,
+                        "quote_volume": getattr(snap, "quote_asset_volume", 0.0),
+                    }
+                ]
+            )
+        return out
+
+    def strategy_wrapper(portfolio_state, klines_snapshot, rolling_snapshot=None):
         from .backtest import AlphaDataView
 
+        if rolling_snapshot is not None and len(rolling_snapshot) > 0:
+            bar_data = rolling_snapshot
+        else:
+            bar_data = _snapshots_to_bar_data(klines_snapshot)
+
         view = AlphaDataView(
-            bar_data=klines,
+            bar_data=bar_data,
             tran_stats={},
-            symbols=set(klines.keys()),
+            symbols=set(bar_data.keys()),
             copy_on_read=False
         )
 

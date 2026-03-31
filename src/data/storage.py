@@ -8,6 +8,7 @@
 import os
 import time
 import shutil
+from collections import OrderedDict
 import pandas as pd
 import polars as pl
 from pathlib import Path
@@ -54,6 +55,9 @@ class DataStorage:
         # 格式: {symbol: schema_dict}，schema_dict包含schema和最后更新时间
         self._schema_cache: Dict[str, Dict] = {}
         self._schema_cache_max_size = config.get('data.storage_schema_cache_max_size', 1000)
+        # 同一进程内多回测并发读相同 (symbol, start, end) 时复用结果，降低重复读盘（返回副本避免污染缓存）
+        self._klines_range_cache_max = int(config.get("data.klines_load_cache_max_entries", 0))
+        self._klines_range_cache: "OrderedDict[tuple, pd.DataFrame]" = OrderedDict()
         self._corrupted_dir = self.data_dir / "corrupted_parquet"
         self._corrupted_dir.mkdir(parents=True, exist_ok=True)
 
@@ -385,6 +389,12 @@ class DataStorage:
         """
         try:
             symbol = format_symbol(symbol)
+            if self._klines_range_cache_max > 0 and start_date is not None and end_date is not None:
+                range_cache_key = (symbol, start_date.isoformat(), end_date.isoformat())
+                if range_cache_key in self._klines_range_cache:
+                    self._klines_range_cache.move_to_end(range_cache_key)
+                    return self._klines_range_cache[range_cache_key].copy()
+
             symbol_dir = self.klines_dir / symbol
 
             if not symbol_dir.exists():
@@ -535,6 +545,12 @@ class DataStorage:
             result = combined_df_pl.to_pandas()
             # 立即清理polars DataFrame
             del combined_df_pl
+            if self._klines_range_cache_max > 0 and start_date is not None and end_date is not None:
+                range_cache_key = (symbol, start_date.isoformat(), end_date.isoformat())
+                self._klines_range_cache[range_cache_key] = result.copy()
+                self._klines_range_cache.move_to_end(range_cache_key)
+                while len(self._klines_range_cache) > self._klines_range_cache_max:
+                    self._klines_range_cache.popitem(last=False)
             return result
 
         except Exception as e:

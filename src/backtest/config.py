@@ -60,6 +60,7 @@ class BacktestConfigManager:
                 'parallel_execution': False,  # 并行执行多个回测
                 'max_workers': 4,  # 最大并行数
                 'rolling_window_bars': 0,
+                'alpha_snapshot_flush_every': 50,  # save_alpha 时 JSONL 批量刷盘条数
             },
         }
     }

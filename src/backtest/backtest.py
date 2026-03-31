@@ -82,6 +82,9 @@ class FactorBacktestConfig:
     rolling_window_bars: int = 1
     save_alpha: bool = False
     alpha_output_dir: Optional[str] = None
+    # 批量刷盘：每 N 个执行步追加一次 JSONL，显著降低大量并发回测时的 IO
+    alpha_flush_every: int = 50
+    alpha_buffered_io: bool = True
 
     def __post_init__(self):
         if self.initial_balance is None:
@@ -186,8 +189,26 @@ class MultiFactorBacktest:
         self._checkpoint_steps: int = 0
         self.factor_weights: Dict[datetime, Dict[str, float]] = {}
         self.next_returns: Dict[datetime, Dict[str, float]] = {}
+        self._alpha_writer: Any = None
+        self._alpha_from_disk: Dict[str, Dict[str, float]] = {}
+        self._init_alpha_snapshot_writer()
         
         self._prepare_symbols()
+
+    def _init_alpha_snapshot_writer(self) -> None:
+        if not self.config.save_alpha or not getattr(self.config, "alpha_buffered_io", True):
+            return
+        from ..strategy.alpha_snapshot_io import AlphaSnapshotRunWriter
+
+        base = self._alpha_base_dir()
+        self._alpha_writer = AlphaSnapshotRunWriter(
+            run_name=self.config.name,
+            base_dir=base,
+            universe_version=self.config.universe_version,
+            flush_every=max(1, int(getattr(self.config, "alpha_flush_every", 50))),
+        )
+        if self.config.run_mode == "increment":
+            self._alpha_from_disk = self._alpha_writer.load_weights_by_ts()
 
     def _parse_interval_minutes(self) -> int:
         interval = str(self.config.interval or "5m").strip().lower()
@@ -227,10 +248,34 @@ class MultiFactorBacktest:
         return self._alpha_base_dir() / self.config.universe_version / yy / mm / dd / time_label / filename
 
     def _alpha_snapshot_exists(self, timestamp: datetime) -> bool:
+        if not self.config.save_alpha:
+            return False
+        from ..strategy.alpha_snapshot_io import ts_iso
+
+        if self._alpha_writer is not None:
+            k = ts_iso(timestamp)
+            return k in self._alpha_from_disk or self._alpha_writer.has_timestamp(timestamp)
         return self._alpha_snapshot_path(timestamp).exists()
 
-    def _save_alpha_snapshot(self, weights: Dict[str, float], timestamp: datetime) -> None:
+    def _save_alpha_snapshot(
+        self,
+        weights: Dict[str, float],
+        timestamp: datetime,
+        *,
+        per_calculator: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> None:
         if not self.config.save_alpha:
+            return
+        from ..strategy.alpha_snapshot_io import ts_iso
+
+        if self._alpha_writer is not None:
+            self._alpha_writer.record(
+                timestamp,
+                weights,
+                per_calculator=per_calculator,
+                source="backtest",
+            )
+            self._alpha_from_disk[ts_iso(timestamp)] = dict(weights)
             return
         out = self._alpha_snapshot_path(timestamp)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +283,12 @@ class MultiFactorBacktest:
         df.to_csv(out, index=False, encoding="utf-8", compression="gzip")
 
     def _load_alpha_snapshot(self, timestamp: datetime) -> Dict[str, float]:
+        from ..strategy.alpha_snapshot_io import ts_iso
+
+        if self._alpha_writer is not None:
+            k = ts_iso(timestamp)
+            if k in self._alpha_from_disk:
+                return dict(self._alpha_from_disk[k])
         path = self._alpha_snapshot_path(timestamp)
         if not path.exists():
             return {}
@@ -456,88 +507,94 @@ class MultiFactorBacktest:
             if verbose:
                 logger.info(f"Incremental mode: resume after {last_ts}, remaining timestamps={len(timestamps)}")
         
-        for i, timestamp in enumerate(timestamps):
-            if i % 100 == 0 and verbose:
-                logger.info(f"Progress: {i}/{len(timestamps)} ({i*100/len(timestamps):.1f}%)")
-            
-            ts = pd.to_datetime(timestamp)
-            current_bar_data = {}
-            view_bar_data = {}
-            for sym in valid_symbols:
-                row_map = symbol_row_by_ts.get(sym, {})
-                row = row_map.get(ts)
-                if row is None:
-                    continue
-                current_bar_data[sym] = row
-                df = normalized_bar_data[sym]
-                idx_map = symbol_idx_by_ts.get(sym, {})
-                idx = idx_map.get(ts)
-                if idx is None:
-                    continue
-
-                if rolling_window_bars > 1:
-                    cache = rolling_idx_cache[sym]
-                    if not cache or idx > cache[-1]:
-                        cache.append(idx)
-                    else:
-                        cache = [x for x in cache if x < idx]
-                        cache.append(idx)
-                    if len(cache) > rolling_window_bars:
-                        del cache[:-rolling_window_bars]
-                    view_bar_data[sym] = df.iloc[cache].copy()
-                else:
-                    view_bar_data[sym] = df.iloc[[idx]].copy()
-            
-            if not current_bar_data:
-                continue
-            
-            view = AlphaDataView(
-                bar_data=view_bar_data,
-                tran_stats={},
-                symbols=set(valid_symbols),
-                copy_on_read=False
-            )
-
-            should_execute = self._is_execution_time(ts)
-            raw_weights = {}
-            if should_execute:
-                # In increment mode, reuse saved alpha snapshot when present.
-                if self.config.run_mode == "increment" and self._alpha_snapshot_exists(ts):
-                    raw_weights = self._load_alpha_snapshot(ts)
-                else:
-                    for calc in calculators:
-                        calc_weights = calc.run(view)
-                        for sym, w in calc_weights.items():
-                            if sym in valid_symbols:
-                                raw_weights[sym] = raw_weights.get(sym, 0.0) + w
-                    self._save_alpha_snapshot(raw_weights, ts)
-            
-            factor_weights[timestamp] = raw_weights.copy()
-            
-            target_weights = self._process_weights(raw_weights)
-            
-            trades = self._rebalance(target_weights, current_bar_data, timestamp)
-            self.trades.extend(trades)
-            
-            portfolio_state = self._update_portfolio(target_weights, current_bar_data, timestamp)
-            self.portfolio_history.append(portfolio_state)
-            
-            next_ts_idx = i + 1
-            if next_ts_idx < len(timestamps):
-                next_ts = pd.to_datetime(timestamps[next_ts_idx])
+        try:
+            for i, timestamp in enumerate(timestamps):
+                if i % 100 == 0 and verbose:
+                    logger.info(f"Progress: {i}/{len(timestamps)} ({i*100/len(timestamps):.1f}%)")
+                
+                ts = pd.to_datetime(timestamp)
+                current_bar_data = {}
+                view_bar_data = {}
                 for sym in valid_symbols:
-                    curr = current_bar_data.get(sym, {})
-                    curr_close = curr.get("close", 0) if curr is not None else 0
-                    next_close = symbol_close_by_ts.get(sym, {}).get(next_ts, 0)
-                    if curr_close and next_close and curr_close > 0:
-                        ret = (next_close - curr_close) / curr_close
-                        next_returns[timestamp] = next_returns.get(timestamp, {})
-                        next_returns[timestamp][sym] = ret
+                    row_map = symbol_row_by_ts.get(sym, {})
+                    row = row_map.get(ts)
+                    if row is None:
+                        continue
+                    current_bar_data[sym] = row
+                    df = normalized_bar_data[sym]
+                    idx_map = symbol_idx_by_ts.get(sym, {})
+                    idx = idx_map.get(ts)
+                    if idx is None:
+                        continue
 
-            if self.config.enable_incremental:
-                self._checkpoint_steps += 1
-                if self._checkpoint_steps % max(1, int(self.config.checkpoint_every_n_steps)) == 0:
-                    self._save_checkpoint(pd.to_datetime(timestamp))
+                    if rolling_window_bars > 1:
+                        cache = rolling_idx_cache[sym]
+                        if not cache or idx > cache[-1]:
+                            cache.append(idx)
+                        else:
+                            cache = [x for x in cache if x < idx]
+                            cache.append(idx)
+                        if len(cache) > rolling_window_bars:
+                            del cache[:-rolling_window_bars]
+                        view_bar_data[sym] = df.iloc[cache].copy()
+                    else:
+                        view_bar_data[sym] = df.iloc[[idx]].copy()
+                
+                if not current_bar_data:
+                    continue
+                
+                view = AlphaDataView(
+                    bar_data=view_bar_data,
+                    tran_stats={},
+                    symbols=set(valid_symbols),
+                    copy_on_read=False
+                )
+
+                should_execute = self._is_execution_time(ts)
+                raw_weights = {}
+                if should_execute:
+                    # In increment mode, reuse saved alpha snapshot when present.
+                    if self.config.run_mode == "increment" and self._alpha_snapshot_exists(ts):
+                        raw_weights = self._load_alpha_snapshot(ts)
+                    else:
+                        per_calc: Dict[str, Dict[str, float]] = {}
+                        for calc in calculators:
+                            calc_weights = calc.run(view)
+                            per_calc[calc.name] = calc_weights
+                            for sym, w in calc_weights.items():
+                                if sym in valid_symbols:
+                                    raw_weights[sym] = raw_weights.get(sym, 0.0) + w
+                        self._save_alpha_snapshot(raw_weights, ts, per_calculator=per_calc)
+                
+                factor_weights[timestamp] = raw_weights.copy()
+                
+                target_weights = self._process_weights(raw_weights)
+                
+                trades = self._rebalance(target_weights, current_bar_data, timestamp)
+                self.trades.extend(trades)
+                
+                portfolio_state = self._update_portfolio(target_weights, current_bar_data, timestamp)
+                self.portfolio_history.append(portfolio_state)
+                
+                next_ts_idx = i + 1
+                if next_ts_idx < len(timestamps):
+                    next_ts = pd.to_datetime(timestamps[next_ts_idx])
+                    for sym in valid_symbols:
+                        curr = current_bar_data.get(sym, {})
+                        curr_close = curr.get("close", 0) if curr is not None else 0
+                        next_close = symbol_close_by_ts.get(sym, {}).get(next_ts, 0)
+                        if curr_close and next_close and curr_close > 0:
+                            ret = (next_close - curr_close) / curr_close
+                            next_returns[timestamp] = next_returns.get(timestamp, {})
+                            next_returns[timestamp][sym] = ret
+
+                if self.config.enable_incremental:
+                    self._checkpoint_steps += 1
+                    if self._checkpoint_steps % max(1, int(self.config.checkpoint_every_n_steps)) == 0:
+                        self._save_checkpoint(pd.to_datetime(timestamp))
+        finally:
+            if self._alpha_writer is not None:
+                self._alpha_writer.flush()
         
         self.factor_weights = factor_weights
         self.next_returns = next_returns

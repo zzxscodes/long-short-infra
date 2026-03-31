@@ -163,6 +163,8 @@ data:
   # 数据API缓存配置
   cache_max_symbols: 1  # 内存缓存最多保留的symbol数量（只缓存最活跃的1个symbol）
   cache_max_klines: 1 # 缓存最大K线数
+  # DataStorage.load_klines 按 (symbol,start,end) 进程内 LRU；多回测同区间复用，减轻并发读盘
+  klines_load_cache_max_entries: 64
 
 strategy:
   history_days: 30
@@ -174,6 +176,9 @@ strategy:
     concurrency: thread
     # 最大并发数（默认等于calculators数量，可根据CPU核心数调整）
     max_workers: null  # null表示自动设置为calculators数量
+    # 实盘每轮 Alpha 结果追加 JSONL，与回测 alpha_records 格式对齐便于对账
+    persist_enabled: true
+    persist_directory: data/alpha_snapshots/live
   
   # 策略进程配置
   process:

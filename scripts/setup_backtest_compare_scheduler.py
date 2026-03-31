@@ -2,6 +2,8 @@
 """
 跨平台安装回测机数据拉取对比定时任务
 
+默认 UTC 12:00：此时「前一 UTC 日」的历史数据（Vision 等）已就绪；脚本默认对比日 = UTC 昨天。
+
 - Windows: 创建 schtasks，可设置时间（默认 20:00 本地时间，对应 UTC+8 的 UTC 12:00）
 - Linux/macOS: 写入 crontab，可设置时间（默认 UTC 12:00，配合 CRON_TZ=UTC）
 
