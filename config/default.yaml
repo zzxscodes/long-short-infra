@@ -325,6 +325,7 @@ execution:
       min_data_points: 100  # 最少数据点数（避免早期误判）
       stop_loss_max_drawdown_pct: 0.15  # 最大回撤阈值（达到此值取消所有订单并停止）
       take_profit_total_return_pct: 0.3  # 止盈总收益率（达到此值取消所有订单并获利了结）
+      feishu_webhook: ""  # 飞书机器人webhook（留空则不发送）
   
   # ===== testnet模式配置 =====
   # 仅在 mode=testnet 时使用

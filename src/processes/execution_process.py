@@ -7,6 +7,8 @@ import signal
 import sys
 import json
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime, timezone, timedelta
@@ -386,7 +388,13 @@ class ExecutionProcess:
                 acct = await self._get_account_snapshot()
                 decision = self.order_manager.method_selector.select_global_action(acct, perf)
                 if decision and decision.method == METHOD_CANCEL_ALL_ORDERS:
-                    await self._cancel_all_orders_and_shutdown(reason=decision.reason or "risk_control")
+                    await self._send_feishu_risk_control_suggestion(
+                        reason=decision.reason or "risk_control"
+                    )
+                    logger.warning(
+                        "Risk control suggested CANCEL_ALL_ORDERS. "
+                        "Auto cancel/shutdown disabled; waiting for manual decision."
+                    )
                     return
             except Exception as e:
                 logger.error(f"Risk control evaluation failed: {e}", exc_info=True)
@@ -626,6 +634,61 @@ class ExecutionProcess:
 
         # 最终停止进程（stop 会额外 cancel pending_orders 并关闭 client）
         await self.stop()
+
+    async def _send_feishu_risk_control_suggestion(self, reason: str) -> None:
+        """
+        发送飞书通知：系统建议“撤单并退出”，由人工决策执行。
+        webhook 从配置读取：execution.method_selection.risk_control.feishu_webhook
+        """
+        webhook = config.get(
+            'execution.method_selection.risk_control.feishu_webhook', ''
+        )
+        if not webhook:
+            logger.warning(
+                "Risk control suggestion not sent: feishu webhook is empty "
+                "(execution.method_selection.risk_control.feishu_webhook)."
+            )
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        text = (
+            "系统建议，撤单并退出\n"
+            f"account_id: {self.account_id}\n"
+            f"reason: {reason}\n"
+            f"ts_utc: {now}"
+        )
+        payload = {
+            "msg_type": "text",
+            "content": {"text": text},
+        }
+        body = json.dumps(payload).encode("utf-8")
+
+        def _post() -> None:
+            req = urllib.request.Request(
+                webhook,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                # 仅读取以完成请求，避免连接资源残留
+                resp.read()
+
+        try:
+            await asyncio.to_thread(_post)
+            logger.info(
+                f"Sent risk control suggestion to Feishu for account {self.account_id}"
+            )
+        except urllib.error.URLError as e:
+            logger.error(
+                f"Failed to send risk control suggestion to Feishu: {e}",
+                exc_info=True,
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error sending risk control suggestion to Feishu: {e}",
+                exc_info=True,
+            )
     
     async def start(self):
         """启动订单执行进程"""
