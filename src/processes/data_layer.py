@@ -1671,6 +1671,34 @@ class DataLayerProcess:
                 missing += 1
         return missing
 
+    @staticmethod
+    def _norm_open_ts(ts) -> int:
+        """用于集合比较的统一时间键（UTC 纳秒）。"""
+        t = pd.Timestamp(ts)
+        if t.tz is None:
+            t = t.tz_localize("UTC")
+        else:
+            t = t.tz_convert("UTC")
+        return int(t.value)
+
+    def _prev_close_merge_asof(
+        self, missing_open_times: List[datetime], base: pd.DataFrame
+    ) -> List[float]:
+        """对缺失的 open_time 栅格，用 base 中同列上一根收盘价做 backward 对齐（无则 0）。"""
+        if not missing_open_times:
+            return []
+        miss_df = pd.DataFrame({"open_time": pd.to_datetime(missing_open_times, utc=True)})
+        miss_df = miss_df.sort_values("open_time")
+        if base.empty:
+            return [0.0] * len(miss_df)
+        b = base[["open_time", "close"]].copy()
+        b["open_time"] = pd.to_datetime(b["open_time"], utc=True, errors="coerce")
+        b = b.dropna(subset=["open_time"]).sort_values("open_time")
+        if b.empty:
+            return [0.0] * len(miss_df)
+        merged = pd.merge_asof(miss_df, b, on="open_time", direction="backward")
+        return [float(x) for x in merged["close"].fillna(0.0).tolist()]
+
     def _build_empty_premium_row(self, symbol: str, open_dt: datetime, prev_close: float) -> dict:
         """与栅格补齐一致结构的溢价指数空行（前值填充）。"""
         close_ts = open_dt + timedelta(minutes=5) - timedelta(milliseconds=1)
@@ -1734,25 +1762,36 @@ class DataLayerProcess:
                         ]["fundingTime"].tolist()
                     )
 
+                missing_ts = [ts for ts in expected_times if ts not in existing]
                 new_rows = []
-                for ts in expected_times:
-                    if ts in existing:
-                        continue
-                    prev = work[work["fundingTime"] < ts]
-                    prev_rate = float(prev.iloc[-1]["fundingRate"]) if (not prev.empty and "fundingRate" in prev.columns) else 0.0
-                    prev_mark = float(prev.iloc[-1]["markPrice"]) if (not prev.empty and "markPrice" in prev.columns) else 0.0
-                    new_rows.append(
-                        {
-                            "symbol": symbol,
-                            "fundingTime": ts,
-                            "fundingRate": prev_rate,
-                            "markPrice": prev_mark,
-                        }
+                if missing_ts:
+                    miss_df = pd.DataFrame({"fundingTime": pd.to_datetime(missing_ts, utc=True)}).sort_values(
+                        "fundingTime"
                     )
-                    work = pd.concat(
-                        [work, pd.DataFrame([{"fundingTime": ts, "fundingRate": prev_rate, "markPrice": prev_mark}])],
-                        ignore_index=True,
-                    )
+                    w = work.sort_values("fundingTime")
+                    if w.empty:
+                        for ts in miss_df["fundingTime"]:
+                            new_rows.append(
+                                {
+                                    "symbol": symbol,
+                                    "fundingTime": ts,
+                                    "fundingRate": 0.0,
+                                    "markPrice": 0.0,
+                                }
+                            )
+                    else:
+                        m = pd.merge_asof(miss_df, w, on="fundingTime", direction="backward")
+                        for i, ts in enumerate(miss_df["fundingTime"]):
+                            pr = float(m["fundingRate"].iloc[i]) if pd.notna(m["fundingRate"].iloc[i]) else 0.0
+                            pm = float(m["markPrice"].iloc[i]) if pd.notna(m["markPrice"].iloc[i]) else 0.0
+                            new_rows.append(
+                                {
+                                    "symbol": symbol,
+                                    "fundingTime": ts,
+                                    "fundingRate": pr,
+                                    "markPrice": pm,
+                                }
+                            )
 
                 if new_rows:
                     self.storage.save_funding_rates(symbol, pd.DataFrame(new_rows))
@@ -1793,33 +1832,54 @@ class DataLayerProcess:
                         ]["open_time"].tolist()
                     )
 
+                missing_ot = [open_ts for open_ts in expected_times if open_ts not in existing]
                 new_rows = []
-                for open_ts in expected_times:
-                    if open_ts in existing:
-                        continue
-                    prev = work[work["open_time"] < open_ts]
-                    prev_close = float(prev.iloc[-1]["close"]) if not prev.empty else 0.0
-                    close_ts = open_ts + timedelta(minutes=5) - timedelta(milliseconds=1)
-                    new_rows.append(
-                        {
-                            "symbol": symbol,
-                            "open_time": open_ts,
-                            "open": prev_close,
-                            "high": prev_close,
-                            "low": prev_close,
-                            "close": prev_close,
-                            "volume": 0.0,
-                            "close_time": close_ts,
-                            "quote_volume": 0.0,
-                            "trade_count": 0,
-                            "taker_buy_base_volume": 0.0,
-                            "taker_buy_quote_volume": 0.0,
-                        }
+                if missing_ot:
+                    miss_df = pd.DataFrame({"open_time": pd.to_datetime(missing_ot, utc=True)}).sort_values(
+                        "open_time"
                     )
-                    work = pd.concat(
-                        [work, pd.DataFrame([{"open_time": open_ts, "close": prev_close}])],
-                        ignore_index=True,
-                    )
+                    w = work.sort_values("open_time")
+                    if w.empty:
+                        for open_ts in miss_df["open_time"]:
+                            pc = 0.0
+                            close_ts = open_ts + timedelta(minutes=5) - timedelta(milliseconds=1)
+                            new_rows.append(
+                                {
+                                    "symbol": symbol,
+                                    "open_time": open_ts,
+                                    "open": pc,
+                                    "high": pc,
+                                    "low": pc,
+                                    "close": pc,
+                                    "volume": 0.0,
+                                    "close_time": close_ts,
+                                    "quote_volume": 0.0,
+                                    "trade_count": 0,
+                                    "taker_buy_base_volume": 0.0,
+                                    "taker_buy_quote_volume": 0.0,
+                                }
+                            )
+                    else:
+                        m = pd.merge_asof(miss_df, w, on="open_time", direction="backward")
+                        for i, open_ts in enumerate(miss_df["open_time"]):
+                            pc = float(m["close"].iloc[i]) if pd.notna(m["close"].iloc[i]) else 0.0
+                            close_ts = open_ts + timedelta(minutes=5) - timedelta(milliseconds=1)
+                            new_rows.append(
+                                {
+                                    "symbol": symbol,
+                                    "open_time": open_ts,
+                                    "open": pc,
+                                    "high": pc,
+                                    "low": pc,
+                                    "close": pc,
+                                    "volume": 0.0,
+                                    "close_time": close_ts,
+                                    "quote_volume": 0.0,
+                                    "trade_count": 0,
+                                    "taker_buy_base_volume": 0.0,
+                                    "taker_buy_quote_volume": 0.0,
+                                }
+                            )
 
                 if new_rows:
                     self.storage.save_premium_index_klines(symbol, pd.DataFrame(new_rows))
@@ -1835,6 +1895,10 @@ class DataLayerProcess:
     ) -> tuple[int, int]:
         patched_symbols = 0
         patched_windows = 0
+        total = int((end_time - start_time).total_seconds() // 300)
+        if total <= 0:
+            return 0, 0
+
         for symbol in symbols:
             try:
                 hist_start = start_time - timedelta(days=1)
@@ -1856,26 +1920,26 @@ class DataLayerProcess:
                         .sort_values("open_time")
                     )
 
-                existing = set(
-                    working[
-                        (working["open_time"] >= start_time)
-                        & (working["open_time"] < end_time)
-                    ]["open_time"].tolist()
-                )
-                total = int((end_time - start_time).total_seconds() // 300)
-                new_rows: List[dict] = []
+                in_range = working[
+                    (working["open_time"] >= start_time) & (working["open_time"] < end_time)
+                ]
+                existing_ns = {self._norm_open_ts(x) for x in in_range["open_time"].tolist()}
+
+                missing_times: List[datetime] = []
                 for i in range(total):
                     open_dt = start_time + timedelta(minutes=5 * i)
-                    if open_dt in existing:
-                        continue
-                    prev = working[working["open_time"] < open_dt]
-                    prev_close = float(prev.iloc[-1]["close"]) if not prev.empty else 0.0
-                    row = self._build_empty_kline_row(symbol, open_dt, prev_close)
-                    new_rows.append(row)
-                    working = pd.concat(
-                        [working, pd.DataFrame([{"open_time": open_dt, "close": float(prev_close)}])],
-                        ignore_index=True,
-                    )
+                    if self._norm_open_ts(open_dt) not in existing_ns:
+                        missing_times.append(open_dt)
+
+                if not missing_times:
+                    continue
+
+                base = working[["open_time", "close"]]
+                prev_closes = self._prev_close_merge_asof(missing_times, base)
+                new_rows = [
+                    self._build_empty_kline_row(symbol, t, pc)
+                    for t, pc in zip(missing_times, prev_closes)
+                ]
                 if new_rows:
                     self.storage.save_klines(symbol, pd.DataFrame(new_rows))
                     patched_symbols += 1
@@ -1912,25 +1976,26 @@ class DataLayerProcess:
                         .sort_values("open_time")
                     )
 
-                existing = set(
-                    working[
-                        (working["open_time"] >= start_time)
-                        & (working["open_time"] < end_time)
-                    ]["open_time"].tolist()
-                )
+                in_range = working[
+                    (working["open_time"] >= start_time) & (working["open_time"] < end_time)
+                ]
+                existing_ns = {self._norm_open_ts(x) for x in in_range["open_time"].tolist()}
                 total = int((end_time - start_time).total_seconds() // 300)
-                new_rows: List[dict] = []
+                missing_times: List[datetime] = []
                 for i in range(total):
                     open_dt = start_time + timedelta(minutes=5 * i)
-                    if open_dt in existing:
-                        continue
-                    prev = working[working["open_time"] < open_dt]
-                    prev_close = float(prev.iloc[-1]["close"]) if not prev.empty else 0.0
-                    new_rows.append(self._build_empty_premium_row(symbol, open_dt, prev_close))
-                    working = pd.concat(
-                        [working, pd.DataFrame([{"open_time": open_dt, "close": float(prev_close)}])],
-                        ignore_index=True,
-                    )
+                    if self._norm_open_ts(open_dt) not in existing_ns:
+                        missing_times.append(open_dt)
+
+                if not missing_times:
+                    continue
+
+                base = working[["open_time", "close"]]
+                prev_closes = self._prev_close_merge_asof(missing_times, base)
+                new_rows = [
+                    self._build_empty_premium_row(symbol, t, pc)
+                    for t, pc in zip(missing_times, prev_closes)
+                ]
                 if new_rows:
                     self.storage.save_premium_index_klines(symbol, pd.DataFrame(new_rows))
                     patched_symbols += 1
