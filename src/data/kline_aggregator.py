@@ -1663,3 +1663,110 @@ class KlineAggregator:
                 for symbol, dt in self.stats["last_kline_time"].items()
             },
         }
+
+
+def aggregate_vision_agg_trades_to_klines_dataframe(
+    symbol: str,
+    trades: List[Dict[str, Any]],
+    interval_minutes: int = 5,
+) -> pd.DataFrame:
+    """
+    从 data.binance.vision 风格的 aggTrade 列表离线聚合 5m K 线。
+
+    与 :meth:`KlineAggregator._aggregate_window` 中有成交时的核心口径一致：
+    先按 ``ts_ms``（Vision 字段 ``T``）全局排序，再按窗口分组，对 ``price`` 做
+    first/max/min/last，对 ``qty`` / ``quote_qty`` / 底层笔数求和。
+    供 ``scripts/backtest_pull_compare`` / ``prepare_backtest_history_data`` 与实盘
+    data_layer 使用同一套聚合定义，避免与官方 K 线对比时出现无谓偏差。
+    """
+    if not trades:
+        return pd.DataFrame()
+
+    interval_seconds = interval_minutes * 60
+    rows_norm: List[Dict[str, Any]] = []
+    for t in trades:
+        ts_ms = int(t.get("T", 0))
+        if ts_ms <= 0:
+            continue
+        try:
+            price = float(t.get("p", 0))
+            qty = float(t.get("q", 0))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or qty <= 0:
+            continue
+        qq_raw = t.get("Q")
+        try:
+            quote_qty = float(qq_raw) if qq_raw is not None and qq_raw != "" else price * qty
+        except (TypeError, ValueError):
+            quote_qty = price * qty
+        if quote_qty <= 0:
+            quote_qty = price * qty
+        f_id = t.get("f")
+        l_id = t.get("l")
+        if f_id is not None and l_id is not None:
+            try:
+                underlying = max(1, int(l_id) - int(f_id) + 1)
+            except (TypeError, ValueError):
+                underlying = 1
+        else:
+            underlying = 1
+        rows_norm.append(
+            {
+                "ts_ms": ts_ms,
+                "price": price,
+                "qty": qty,
+                "quote_qty": quote_qty,
+                "trade_count": underlying,
+            }
+        )
+
+    if not rows_norm:
+        return pd.DataFrame()
+
+    df = pl.DataFrame(rows_norm)
+    df = df.with_columns(
+        (
+            (pl.col("ts_ms") // 1000 // interval_seconds * interval_seconds) * 1000
+        ).alias("window_start_ms")
+    )
+    # 全局按成交时间排序后分组，保证每组内 first/last 即时间序上的开/收（与 _aggregate_window 一致）
+    df = df.sort("ts_ms")
+    agg = (
+        df.group_by("window_start_ms")
+        .agg(
+            [
+                pl.first("price").alias("open"),
+                pl.max("price").alias("high"),
+                pl.min("price").alias("low"),
+                pl.last("price").alias("close"),
+                pl.sum("qty").alias("volume"),
+                pl.sum("quote_qty").alias("quote_volume"),
+                pl.sum("trade_count").alias("tradecount"),
+            ]
+        )
+        .sort("window_start_ms")
+    )
+
+    sym = format_symbol(symbol)
+    out_rows: List[Dict[str, Any]] = []
+    for row in agg.iter_rows(named=True):
+        ws = int(row["window_start_ms"])
+        window_dt = datetime.fromtimestamp(ws / 1000.0, tz=timezone.utc)
+        window_end_ms = ws + interval_minutes * 60 * 1000
+        close_dt = datetime.fromtimestamp(window_end_ms / 1000.0, tz=timezone.utc)
+        out_rows.append(
+            {
+                "symbol": sym,
+                "open_time": window_dt,
+                "close_time": close_dt,
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"],
+                "quote_volume": row["quote_volume"],
+                "tradecount": row["tradecount"],
+            }
+        )
+    return pd.DataFrame(out_rows)

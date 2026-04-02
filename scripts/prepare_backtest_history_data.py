@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+"""长区间回测历史数据准备（无实盘 SSH）。
+
+与 ``backtest_pull_compare.py`` 分工：
+- **本脚本**：按 UTC 日批量从 data.binance.vision 拉取 funding / premium / aggTrade，
+  用与实盘 ``data_layer`` / ``KlineAggregator`` 相同的 aggTrade→5m K 线聚合（经
+  ``aggregate_vision_agg_trades_to_klines_dataframe``），写入本地目录并做官方 K 线校验。
+  **候选交易对**：优先 ``/fapi/v1/exchangeInfo`` + ``onboardDate``（UTC 日）。
+  若 fapi 不可达，则回退 **data.binance.vision** 上与官方一致的月度 5m K 线 ZIP 路径，对种子符号做 HEAD，
+  按 UTC 年月缓存（不 SSH、不从实盘拉 universe）。
+- **compare 脚本**：检测「最近」实盘落盘与官方是否一致，并修复本地；可依赖 SSH。
+
+二者共用 ``_compare_symbol_day``、Vision 拉取与 K 线聚合实现，保证口径一致。
+
+**完整性**：默认任一日 K 线对比存在 ``fail>0`` 时进程退出码为 **2**，并写入
+``{start}_{end}.history_range_summary.json``；仅排查时可加 ``--allow-partial``。
+"""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +26,7 @@ import sys
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import aiohttp
 import pandas as pd
@@ -24,11 +40,13 @@ DEFAULT_PID_PATH = PROJECT_ROOT / "logs" / "prepare_backtest_history.pid"
 from src.common.config import config
 from src.common.utils import ensure_directory, format_symbol
 from scripts.backtest_pull_compare import (
-    DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR,
+    DATA_VISION_BASE,
     PullCompareConfig,
+    default_backtest_compare_output_dir,
     SymbolCompareResult,
     _load_local_kline_df,
     _load_universe_symbols,
+    _month_str,
     _aggregate_agg_trades_to_klines,
     _compare_symbol_day,
     _fetch_agg_trades_from_vision,
@@ -39,7 +57,6 @@ from scripts.backtest_pull_compare import (
     _save_funding_history,
     _save_klines_parquet,
     _save_premium_history,
-    pull_universe_from_live,
 )
 
 
@@ -58,34 +75,216 @@ def _iter_days(start_day: date, end_day: date) -> List[date]:
     return out
 
 
-async def _fetch_exchange_symbols(session: aiohttp.ClientSession, api_base: str) -> List[str]:
-    url = f"{api_base}/fapi/v1/exchangeInfo"
-    async with session.get(url, timeout=30) as resp:
-        resp.raise_for_status()
-        payload = await resp.json()
+# 进程内只拉一次 exchangeInfo，再按日历日过滤 onboardDate（history 按日换池）
+_exchange_info_payload_cache: Dict[str, Any] | None = None
+# fapi 不可达时改为 Vision 月度 K 线 ZIP 的 HEAD 探测 + 种子列表（按 UTC 年月缓存）
+_CANDIDATE_POOL_MODE: str = "fapi"
+_vision_month_candidates_cache: Dict[Tuple[int, int], List[str]] = {}
+
+
+def _utc_day_end_ms(d: date) -> int:
+    end = datetime(d.year, d.month, d.day, 23, 59, 59, 999000, tzinfo=timezone.utc)
+    return int(end.timestamp() * 1000)
+
+
+def _symbols_as_of_utc_day_from_exchange_info(symbols: List[Dict[str, Any]], as_of_day: date) -> List[str]:
+    """
+    用当前 exchangeInfo 快照近似「截至 as_of_day（UTC）日终」可交易的 USDT 永续池：
+    onboardDate <= 该日日终，且 status==TRADING。已下架合约若不在当前 snapshot 中则无法包含（API 局限）。
+    """
+    cutoff = _utc_day_end_ms(as_of_day)
     out: List[str] = []
-    for item in payload.get("symbols", []):
-        if (
-            item.get("status") == "TRADING"
-            and item.get("quoteAsset") == "USDT"
-            and item.get("contractType") == "PERPETUAL"
-        ):
-            out.append(format_symbol(item.get("symbol", "")))
-    return sorted([s for s in out if s])
+    for item in symbols:
+        if item.get("contractType") != "PERPETUAL" or item.get("quoteAsset") != "USDT":
+            continue
+        if item.get("status") != "TRADING":
+            continue
+        od = item.get("onboardDate")
+        if od is None:
+            continue
+        try:
+            if int(od) > cutoff:
+                continue
+        except (TypeError, ValueError):
+            continue
+        s = format_symbol(item.get("symbol", ""))
+        if s:
+            out.append(s)
+    return sorted(set(out))
 
 
-async def _fetch_exchange_symbols_with_retries(api_base: str, retries: int, retry_delay_s: float) -> List[str]:
+async def _try_prime_fapi_exchange_info_quick(api_base: str, *, timeout_s: float = 12.0, attempts: int = 2) -> bool:
+    """
+    启动时快速探测 fapi 是否可达并缓存 exchangeInfo；失败则尽快切 Vision，避免长时间卡在长超时重试上。
+    """
+    global _exchange_info_payload_cache
+    if _exchange_info_payload_cache is not None:
+        return True
+    url = f"{api_base.rstrip('/')}/fapi/v1/exchangeInfo"
     last_err: Exception | None = None
+    for i in range(max(1, attempts)):
+        try:
+            t = aiohttp.ClientTimeout(total=timeout_s, connect=min(8.0, timeout_s * 0.6), sock_read=timeout_s)
+            connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300, enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(
+                timeout=t,
+                connector=connector,
+                headers={"User-Agent": "history-prepare/1.0"},
+            ) as session:
+                async with session.get(url, timeout=t) as resp:
+                    resp.raise_for_status()
+                    _exchange_info_payload_cache = await resp.json()
+                    return True
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if i < attempts - 1:
+                await asyncio.sleep(0.4 * (i + 1))
+    print(f"[history_prepare] fapi exchangeInfo quick probe failed ({last_err!r})", flush=True)
+    return False
+
+
+async def _fetch_exchange_info_payload_with_retries(api_base: str, retries: int, retry_delay_s: float) -> Dict[str, Any]:
+    global _exchange_info_payload_cache
+    if _exchange_info_payload_cache is not None:
+        return _exchange_info_payload_cache
+    last_err: Exception | None = None
+    url = f"{api_base.rstrip('/')}/fapi/v1/exchangeInfo"
+    req_timeout = aiohttp.ClientTimeout(total=180, connect=45, sock_read=150)
     for i in range(max(1, retries)):
         try:
-            timeout = aiohttp.ClientTimeout(total=60)
-            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "history-prepare/1.0"}) as session:
-                return await _fetch_exchange_symbols(session, api_base)
+            timeout = aiohttp.ClientTimeout(total=240, connect=45, sock_read=180)
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={"User-Agent": "history-prepare/1.0"},
+            ) as session:
+                async with session.get(url, timeout=req_timeout) as resp:
+                    resp.raise_for_status()
+                    _exchange_info_payload_cache = await resp.json()
+                    return _exchange_info_payload_cache
         except Exception as e:  # noqa: BLE001
             last_err = e
             if i < retries - 1:
                 await asyncio.sleep(retry_delay_s * (2 ** i))
-    raise RuntimeError(f"fetch exchange symbols failed after retries: {last_err}") from last_err
+    raise RuntimeError(f"fetch exchangeInfo failed after retries: {last_err}") from last_err
+
+
+def _load_candidate_seed_symbols(extra_path: str) -> List[str]:
+    """
+    若显式传入 ``--candidate-seed-file`` 且文件可读、非空，则**仅**使用该文件（便于缩小探测范围）。
+    否则依次尝试：仓库 ``scripts/data/binance_um_futures_symbol_seed.txt``、``data/binance_um_futures_symbol_seed.txt``。
+    """
+    seen: set[str] = set()
+    out: List[str] = []
+
+    def _consume_file(p: Path) -> None:
+        nonlocal out, seen
+        text = p.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            s = format_symbol(line.split()[0])
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+
+    if extra_path.strip():
+        p = Path(extra_path).expanduser()
+        if p.is_file():
+            try:
+                _consume_file(p)
+            except Exception:
+                pass
+            if out:
+                return sorted(out)
+        out = []
+        seen = set()
+
+    for p in (
+        PROJECT_ROOT / "scripts" / "data" / "binance_um_futures_symbol_seed.txt",
+        PROJECT_ROOT / "data" / "binance_um_futures_symbol_seed.txt",
+    ):
+        if not p.is_file():
+            continue
+        try:
+            _consume_file(p)
+        except Exception:
+            continue
+        if out:
+            break
+
+    if not out:
+        raise RuntimeError(
+            "候选种子为空：请配置 scripts/data/binance_um_futures_symbol_seed.txt 或使用 --candidate-seed-file"
+        )
+    return sorted(out)
+
+
+async def _fetch_symbols_via_vision_monthly_heads(
+    as_of_day: date,
+    seed: Sequence[str],
+    head_concurrent: int,
+) -> List[str]:
+    """
+    当 fapi 不可用时：对种子列表做 HEAD
+    ``.../monthly/klines/{SYM}/5m/{SYM}-5m-{YYYY-MM}.zip``。
+    命中表示该月在 Vision 上存在官方 5m K 线归档（与后续拉取路径一致），按 UTC 年月缓存。
+    """
+    global _vision_month_candidates_cache
+    key = (as_of_day.year, as_of_day.month)
+    if key in _vision_month_candidates_cache:
+        return _vision_month_candidates_cache[key]
+    month_tag = _month_str(as_of_day)
+    timeout = aiohttp.ClientTimeout(total=90, connect=25, sock_read=40)
+    sem = asyncio.Semaphore(max(1, int(head_concurrent)))
+    headers = {"User-Agent": "history-prepare/vision-head/1.0"}
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+
+        async def probe(sym: str) -> Optional[str]:
+            s = format_symbol(sym)
+            url = (
+                f"{DATA_VISION_BASE}/data/futures/um/monthly/klines/{s}/5m/{s}-5m-{month_tag}.zip"
+            )
+            async with sem:
+                try:
+                    async with session.head(url, allow_redirects=True, timeout=timeout) as resp:
+                        if resp.status == 200:
+                            return s
+                except Exception:
+                    pass
+            return None
+
+        results = await asyncio.gather(*(probe(s) for s in seed))
+    ok = sorted({s for s in results if s})
+    _vision_month_candidates_cache[key] = ok
+    print(
+        f"  Vision: monthly 5m kline ZIP HEAD ok for {len(ok)}/{len(seed)} seeds (UTC month={month_tag})",
+        flush=True,
+    )
+    if not ok:
+        raise RuntimeError(
+            "Vision HEAD 未命中任何种子符号：请检查 data.binance.vision 连通性，或扩充种子列表 "
+            "(scripts/data/binance_um_futures_symbol_seed.txt / --candidate-seed-file)。"
+        )
+    return ok
+
+
+async def _fetch_exchange_symbols_as_of_day(
+    api_base: str,
+    as_of_day: date,
+    retries: int,
+    retry_delay_s: float,
+    candidate_seed: Sequence[str],
+    vision_head_concurrent: int,
+) -> List[str]:
+    global _CANDIDATE_POOL_MODE
+    if _CANDIDATE_POOL_MODE == "fapi":
+        payload = await _fetch_exchange_info_payload_with_retries(api_base, retries, retry_delay_s)
+        return _symbols_as_of_utc_day_from_exchange_info(list(payload.get("symbols", [])), as_of_day)
+    return await _fetch_symbols_via_vision_monthly_heads(as_of_day, candidate_seed, vision_head_concurrent)
 
 
 def _save_universe_csv(universe_dir: Path, day: date, symbols: Sequence[str]) -> Path:
@@ -99,22 +298,56 @@ def _save_universe_csv(universe_dir: Path, day: date, symbols: Sequence[str]) ->
     return p
 
 
-def _load_best_local_universe_symbols(universe_base: Path | None = None) -> List[str]:
-    base = universe_base or Path(config.get("data.universe_directory", "data/universe"))
-    best: List[str] = []
-    if not base.exists():
-        return best
-    for p in base.glob("*/v1/universe.csv"):
-        try:
-            with p.open("r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                syms = sorted({format_symbol(row.get("symbol", "")) for row in reader if row.get("symbol")})
-            syms = [s for s in syms if s]
-            if len(syms) > len(best):
-                best = syms
-        except Exception:
-            continue
-    return best
+async def _resolve_candidate_symbols_for_day(
+    *,
+    args: argparse.Namespace,
+    cfg: PullCompareConfig,
+    uroot: Path,
+    target_day: date,
+    candidate_seed: Sequence[str],
+    vision_head_concurrent: int,
+) -> List[str]:
+    """
+    - ``symbol_source=universe``：仅用本地 ``<= target_day`` 的 universe.csv（无则空）。
+    - ``auto``：先尝试本地；不足 ``min_candidate_symbols`` 或为空时，用交易所 exchangeInfo
+      按 ``onboardDate`` 过滤出截至 ``target_day``（UTC）的池（不 SSH）。
+    - ``exchange``：始终用交易所按日过滤池。
+    """
+    api_base = str(config.get("execution.live.api_base", "https://fapi.binance.com"))
+    symbols: List[str] = []
+    if args.symbol_source in ("universe", "auto"):
+        symbols = _load_universe_symbols(target_day=target_day, universe_dir=uroot)
+    if args.symbol_source == "exchange":
+        symbols = await _fetch_exchange_symbols_as_of_day(
+            api_base,
+            target_day,
+            retries=max(2, int(args.retries)),
+            retry_delay_s=float(args.retry_delay_s),
+            candidate_seed=candidate_seed,
+            vision_head_concurrent=vision_head_concurrent,
+        )
+        src = "fapi onboardDate" if _CANDIDATE_POOL_MODE == "fapi" else "Vision monthly ZIP HEAD + seed"
+        print(
+            f"  Candidate symbols ({src}, as-of {target_day.isoformat()} UTC): {len(symbols)}",
+            flush=True,
+        )
+    elif (len(symbols) < int(args.min_candidate_symbols)) and args.symbol_source in ("auto",):
+        symbols = await _fetch_exchange_symbols_as_of_day(
+            api_base,
+            target_day,
+            retries=max(2, int(args.retries)),
+            retry_delay_s=float(args.retry_delay_s),
+            candidate_seed=candidate_seed,
+            vision_head_concurrent=vision_head_concurrent,
+        )
+        src = "fapi onboardDate" if _CANDIDATE_POOL_MODE == "fapi" else "Vision monthly ZIP HEAD + seed"
+        print(
+            f"  Candidate symbols ({src}, as-of {target_day.isoformat()} UTC): {len(symbols)}",
+            flush=True,
+        )
+    if args.symbol_limit > 0:
+        symbols = symbols[: args.symbol_limit]
+    return symbols
 
 
 def _save_trades_parquet(trades_dir: Path, symbol: str, day: date, trades: List[Dict]) -> Path:
@@ -273,60 +506,105 @@ async def _main_async(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    hr = str(config.get("data.backtest_history_data_root", "") or "").strip()
+    if hr:
+        root = Path(hr)
+        local_klines_dir = args.local_klines_dir or str(root / "klines")
+        local_funding_rates_dir = args.local_funding_dir or str(root / "funding_rates")
+        local_premium_index_dir = args.local_premium_dir or str(root / "premium_index")
+        local_universe_dir = args.local_universe_dir or str(root / "universe")
+        local_trades_dir = args.trades_dir or str(root / "trades")
+    else:
+        local_klines_dir = args.local_klines_dir or str(config.get("data.klines_directory", "data/klines"))
+        local_funding_rates_dir = args.local_funding_dir or str(config.get("data.funding_rates_directory", "data/funding_rates"))
+        local_premium_index_dir = args.local_premium_dir or str(config.get("data.premium_index_directory", "data/premium_index"))
+        local_universe_dir = args.local_universe_dir or str(config.get("data.universe_directory", "data/universe"))
+        local_trades_dir = args.trades_dir or str(config.get("data.trades_directory", "data/trades"))
+
     cfg = PullCompareConfig(
         live_host=str(config.get("data.backtest_pull_live_host", "")),
         live_user=str(config.get("data.backtest_pull_live_user", "")),
         live_universe_dir=str(config.get("data.backtest_pull_live_universe_dir", "")),
-        local_klines_dir=args.local_klines_dir or str(config.get("data.klines_directory", "data/klines")),
-        local_funding_rates_dir=args.local_funding_dir or str(config.get("data.funding_rates_directory", "data/funding_rates")),
-        local_premium_index_dir=args.local_premium_dir or str(config.get("data.premium_index_directory", "data/premium_index")),
-        local_universe_dir=args.local_universe_dir or str(config.get("data.universe_directory", "data/universe")),
-        local_trades_dir=args.trades_dir or str(config.get("data.trades_directory", "data/trades")),
+        local_klines_dir=local_klines_dir,
+        local_funding_rates_dir=local_funding_rates_dir,
+        local_premium_index_dir=local_premium_index_dir,
+        local_universe_dir=local_universe_dir,
+        local_trades_dir=local_trades_dir,
         max_concurrent=int(args.max_concurrent),
         retries=int(args.retries),
         retry_delay_s=float(args.retry_delay_s),
     )
 
-    report_dir = Path(args.output_dir or DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR)
+    report_dir = Path(args.output_dir or default_backtest_compare_output_dir())
     uroot = Path(cfg.local_universe_dir)
 
-    symbols: List[str] = []
-    if args.symbols:
-        symbols = [format_symbol(s.strip()) for s in args.symbols.split(",") if s.strip()]
-    if args.symbol_source in ("universe", "auto"):
-        # 与 backtest_pull_compare 主流程一致：先本地 <= start_day，没有再 SSH 拉实盘 universe
-        symbols = symbols or _load_universe_symbols(target_day=start_day, universe_dir=uroot)
-        if not symbols and cfg.live_universe_dir:
-            print(
-                f"\n[Step 0] Local universe not found (<= {start_day}), pulling from live machine..."
-            )
-            try:
-                if pull_universe_from_live(cfg, target_day=start_day):
-                    symbols = _load_universe_symbols(target_day=start_day, universe_dir=uroot)
-            except Exception:
-                pass
-        # 实盘若仅有较新日期目录，<= start_day 会拉不到；再尝试拉最新一日作候选池（与旧逻辑兼容）
-        if len(symbols) < int(args.min_candidate_symbols):
-            try:
-                if pull_universe_from_live(cfg, target_day=None):
-                    symbols = _load_universe_symbols(target_day=None, universe_dir=uroot)
-            except Exception:
-                pass
-        if len(symbols) < int(args.min_candidate_symbols):
-            best = _load_best_local_universe_symbols(uroot)
-            if len(best) > len(symbols):
-                symbols = best
-    if (len(symbols) < int(args.min_candidate_symbols)) and args.symbol_source in ("exchange", "auto"):
-        symbols = await _fetch_exchange_symbols_with_retries(
-            str(config.get("execution.live.api_base", "https://fapi.binance.com")),
-            retries=max(2, int(args.retries)),
-            retry_delay_s=float(args.retry_delay_s),
-        )
-    if args.symbol_limit > 0:
-        symbols = symbols[: args.symbol_limit]
-    print(f"Candidate symbols: {len(symbols)}")
+    global _CANDIDATE_POOL_MODE, _vision_month_candidates_cache, _exchange_info_payload_cache
+    _CANDIDATE_POOL_MODE = "fapi"
+    _vision_month_candidates_cache.clear()
+    _exchange_info_payload_cache = None
 
+    candidate_seed = _load_candidate_seed_symbols(getattr(args, "candidate_seed_file", "") or "")
+    api_base = str(config.get("execution.live.api_base", "https://fapi.binance.com"))
+    print(
+        f"[history_prepare] pid={os.getpid()} calendar_days={len(days)} range={start_day}..{end_day} "
+        f"seed_symbols={len(candidate_seed)}",
+        flush=True,
+    )
+    print(
+        f"[history_prepare] report_dir={report_dir} local_klines_dir={cfg.local_klines_dir}",
+        flush=True,
+    )
+    if await _try_prime_fapi_exchange_info_quick(api_base, timeout_s=12.0, attempts=2):
+        print(
+            "[history_prepare] exchangeInfo (fapi) OK — 候选池在需要时使用 onboardDate",
+            flush=True,
+        )
+    else:
+        _CANDIDATE_POOL_MODE = "vision"
+        print(
+            "[history_prepare] 候选池改为 data.binance.vision 月度 5m K 线 ZIP HEAD + 种子列表",
+            flush=True,
+        )
+
+    vhead = int(getattr(args, "vision_head_concurrent", 32))
+
+    # 显式 --symbols：全程固定；否则按 fapi+onboardDate 或 Vision HEAD+种子解析候选池
+    explicit_symbols: List[str] | None = None
+    if args.symbols:
+        explicit_symbols = [format_symbol(s.strip()) for s in args.symbols.split(",") if s.strip()]
+        print(f"Candidate symbols (explicit): {len(explicit_symbols)}")
+
+    anchored_symbols: List[str] | None = None
+    if explicit_symbols is None and args.anchor_universe_to_start_day:
+        anchored_symbols = await _resolve_candidate_symbols_for_day(
+            args=args,
+            cfg=cfg,
+            uroot=uroot,
+            target_day=start_day,
+            candidate_seed=candidate_seed,
+            vision_head_concurrent=vhead,
+        )
+        print(
+            f"Candidate symbols (anchored to start_day={start_day}): {len(anchored_symbols)}"
+        )
+
+    days_with_kline_fail: List[str] = []
     for d in days:
+        if explicit_symbols is not None:
+            symbols = explicit_symbols
+        elif anchored_symbols is not None:
+            symbols = anchored_symbols
+        else:
+            symbols = await _resolve_candidate_symbols_for_day(
+                args=args,
+                cfg=cfg,
+                uroot=uroot,
+                target_day=d,
+                candidate_seed=candidate_seed,
+                vision_head_concurrent=vhead,
+            )
+            print(f"[{d}] Candidate symbols: {len(symbols)}")
+
         out_path, ok, fail = await _prepare_one_day(
             day=d,
             cfg=cfg,
@@ -336,7 +614,31 @@ async def _main_async(args: argparse.Namespace) -> int:
             persist_trades=bool(args.persist_trades),
         )
         print(f"[{d}] history report: {out_path} | ok={ok} fail={fail}")
+        if fail > 0:
+            days_with_kline_fail.append(d.isoformat())
 
+    summary_path = report_dir / f"{start_day.isoformat()}_{end_day.isoformat()}.history_range_summary.json"
+    range_complete = len(days_with_kline_fail) == 0
+    summary_payload: Dict[str, Any] = {
+        "mode": "history_prepare_range",
+        "start_day": start_day.isoformat(),
+        "end_day": end_day.isoformat(),
+        "total_calendar_days": len(days),
+        "days_with_kline_failures": days_with_kline_fail,
+        "data_complete": range_complete,
+    }
+    summary_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(
+        f"\n[Range summary] complete={range_complete} days_with_fail={len(days_with_kline_fail)} "
+        f"-> {summary_path}"
+    )
+    if not range_complete and not args.allow_partial:
+        print(
+            "Exit 2: 存在 K 线校验未通过的日历日；数据完整性未满足。"
+            "若需先跑通流水线再排查，可加 --allow-partial。",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 
@@ -355,13 +657,31 @@ def main() -> int:
         "--symbol-source",
         choices=["auto", "universe", "exchange"],
         default="auto",
-        help="Candidate symbol source. auto=prefer local universe, fallback exchangeInfo.",
+        help="auto=prefer local universe (<=day) if >=min-candidate else exchangeInfo+onboardDate for that UTC day; "
+        "universe=local CSV only; exchange=each day from exchangeInfo+onboardDate. No live SSH.",
     )
     parser.add_argument("--min-candidate-symbols", type=int, default=50, help="If candidates below this threshold, fallback to other source.")
     parser.add_argument(
+        "--candidate-seed-file",
+        default="",
+        help="Optional extra seed file (one symbol per line, # comments ok); merged with scripts/data/binance_um_futures_symbol_seed.txt.",
+    )
+    parser.add_argument(
+        "--vision-head-concurrent",
+        type=int,
+        default=32,
+        help="When fapi is unreachable, concurrent HEAD requests to data.binance.vision monthly kline ZIPs (default 32).",
+    )
+    parser.add_argument(
+        "--anchor-universe-to-start-day",
+        action="store_true",
+        help="Use one candidate pool from universe <= start_day for the entire range (legacy). "
+        "Default: resolve candidates per day (same as backtest_pull_compare for that day's target_day).",
+    )
+    parser.add_argument(
         "--output-dir",
-        default=DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR,
-        help="Report output dir (same default as backtest_pull_compare.py).",
+        default=None,
+        help="Report JSON output dir (default: data.backtest_compare_output_directory, same as backtest_pull_compare).",
     )
     parser.add_argument("--local-klines-dir", default="")
     parser.add_argument("--local-funding-dir", default="")
@@ -376,6 +696,11 @@ def main() -> int:
         "--persist-trades",
         action="store_true",
         help="Persist aggTrade parquet files for history run (default: false).",
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Exit 0 even if some days have kline compare failures (default: exit 2 when any day has fail>0).",
     )
     args = parser.parse_args()
     return asyncio.run(_main_async(args))

@@ -2,6 +2,15 @@
 """
 回测机主动拉取实盘数据并对比
 
+脚本分工（与 prepare_backtest_history_data 的关系）：
+- **本脚本（compare）**：面向「最近历史」的**实盘数据质量检测**。从实盘机 SSH 拉取与线上 data_layer
+  同路径落盘的 klines/funding/premium，再与 Binance 官方（Vision / REST）对照；不一致时用 Vision
+  aggTrade **经与实盘相同的 K 线聚合口径**（见 ``src.data.kline_aggregator.aggregate_vision_agg_trades_to_klines_dataframe``）
+  重算并覆盖本地，保证回测侧与线上一致。
+- **prepare_backtest_history_data**：面向「长区间」的**纯历史回测数据准备**。无 SSH、不拉实盘，
+  仅依赖 Vision：按日生成 universe、拉 funding/premium/aggTrade、用同一套聚合写入本地目录，
+  并用 ``_compare_symbol_day`` 与官方 5m K 线做校验。
+
 设计约定（与定时任务一致）：
 - 在 **UTC 日历日 D 的 12:00** 执行（见 scripts/setup_backtest_compare_scheduler.py）。
   此时 **UTC 的「前一」日 D-1** 的历史数据（含 data.binance.vision 日文件等）才视为已就绪，故默认
@@ -50,17 +59,25 @@ except ImportError as e:
 
 from src.common.config import config
 from src.common.utils import ensure_directory, format_symbol
+from src.data.kline_aggregator import aggregate_vision_agg_trades_to_klines_dataframe
 
 DATA_VISION_BASE = "https://data.binance.vision"
 
 # 默认报告输出目录（prepare_backtest_history_data 与之保持一致，便于同一目录查看 *.json）
-DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR = "data/compare/backtest_pull"
+def default_backtest_compare_output_dir() -> str:
+    """JSON 报告目录：优先 config data.backtest_compare_output_directory（如 LongShort/compare/backtest_pull）。"""
+    v = config.get("data.backtest_compare_output_directory")
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    return "compare/backtest_pull"
 
 DEFAULT_PID_PATH = PROJECT_ROOT / "logs" / "backtest_pull_compare.pid"
 
 # Vision 日文件在“刚产出/刚同步”阶段可能短暂 404；对 404 额外重试，避免误判为空数据。
-VISION_404_RETRIES_DEFAULT = 6
+VISION_404_RETRIES_DEFAULT = 8
 VISION_404_RETRY_DELAY_S_DEFAULT = 3.0
+# 对 429/502/503/504 等瞬态错误的额外重试次数（不计入 404 窗口）
+VISION_TRANSIENT_MAX_RETRIES = 10
 
 @dataclass(frozen=True)
 class FieldTolerance:
@@ -91,10 +108,10 @@ class PullCompareConfig:
     local_universe_dir: str = ""
     # 仅历史准备脚本写 aggTrade parquet；日更对比脚本不用
     local_trades_dir: str = ""
-    timeout_s: float = 60.0
+    timeout_s: float = 120.0
     max_concurrent: int = 5
-    retries: int = 3
-    retry_delay_s: float = 0.8
+    retries: int = 5
+    retry_delay_s: float = 1.0
     vision_404_retries: int = VISION_404_RETRIES_DEFAULT
     vision_404_retry_delay_s: float = VISION_404_RETRY_DELAY_S_DEFAULT
     # 单个 symbol 每日允许的最大 mismatched 行占比（0.01 = 1%）
@@ -345,42 +362,77 @@ async def _fetch_funding_history(
 async def _fetch_premium_history(
     session: aiohttp.ClientSession, symbol: str, day: date, retries: int, retry_delay_s: float
 ) -> pd.DataFrame:
+    """
+    从 data.binance.vision 拉取 premiumIndex 5m（日 ZIP；与 klines 一致对 404 额外重试；空则月包切片）。
+    """
     sym = format_symbol(symbol)
     day_str = day.isoformat()
-    url = f"{DATA_VISION_BASE}/data/futures/um/daily/premiumIndexKlines/{sym}/5m/{sym}-5m-{day_str}.zip"
-    last_err: Optional[BaseException] = None
-    rows: List[List[str]] = []
-    for attempt in range(max(1, retries)):
-        try:
-            async with session.get(url, timeout=60.0) as resp:
-                if resp.status == 404:
-                    return pd.DataFrame(columns=["key", "open", "high", "low", "close"])
-                if resp.status != 200:
-                    raise RuntimeError(f"HTTP {resp.status}")
-                zcontent = await resp.read()
-            with zipfile.ZipFile(io.BytesIO(zcontent), "r") as zf:
-                names = zf.namelist()
-                if not names:
-                    return pd.DataFrame(columns=["key", "open", "high", "low", "close"])
-                with zf.open(names[0]) as f:
-                    reader = csv.reader(io.TextIOWrapper(f))
-                    rows = list(reader)
-            break
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                await asyncio.sleep(retry_delay_s * (2 ** attempt))
-    if not rows and last_err is not None:
-        raise RuntimeError(f"premiumIndexKlines vision fetch failed: {url} err={last_err}") from last_err
+    daily_url = f"{DATA_VISION_BASE}/data/futures/um/daily/premiumIndexKlines/{sym}/5m/{sym}-5m-{day_str}.zip"
+
+    rows = await _fetch_vision_zip_csv_rows(
+        session,
+        url=daily_url,
+        timeout_s=60.0,
+        retries=retries,
+        retry_delay_s=retry_delay_s,
+        extra_404_retries=VISION_404_RETRIES_DEFAULT,
+        extra_404_retry_delay_s=VISION_404_RETRY_DELAY_S_DEFAULT,
+    )
+
+    if not rows:
+        murl = (
+            f"{DATA_VISION_BASE}/data/futures/um/monthly/premiumIndexKlines/{sym}/5m/"
+            f"{sym}-5m-{_month_str(day)}.zip"
+        )
+        mrows = await _fetch_vision_zip_csv_rows(
+            session,
+            url=murl,
+            timeout_s=60.0,
+            retries=max(1, retries),
+            retry_delay_s=retry_delay_s,
+        )
+        if not mrows:
+            return pd.DataFrame(columns=["key", "open", "high", "low", "close"])
+
+        start_dt = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int((start_dt + timedelta(days=1)).timestamp() * 1000)
+
+        filtered: List[List[str]] = []
+        for r in mrows:
+            if not r or r[0] == "open_time":
+                continue
+            try:
+                ot = int(r[0])
+            except Exception:
+                continue
+            if start_ms <= ot < end_ms:
+                filtered.append(r)
+        rows = [["open_time", "open", "high", "low", "close"]] + filtered
+
     out = []
     for r in rows or []:
         try:
             if r and r[0] == "open_time":
                 continue
-            out.append({"key": _premium_key(int(r[0])), "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4])})
+            if len(r) < 5:
+                continue
+            out.append(
+                {
+                    "key": _premium_key(int(r[0])),
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                }
+            )
         except Exception:
             continue
-    return pd.DataFrame(out, columns=["key", "open", "high", "low", "close"]).drop_duplicates(subset=["key"], keep="last").sort_values("key")
+    return (
+        pd.DataFrame(out, columns=["key", "open", "high", "low", "close"])
+        .drop_duplicates(subset=["key"], keep="last")
+        .sort_values("key")
+    )
 
 
 def _compare_funding_symbol(symbol: str, day: date, local_df: pd.DataFrame, remote_df: pd.DataFrame) -> FundingCompareResult:
@@ -489,7 +541,7 @@ async def compare_funding_and_premium(
     funding_dir = Path(cfg.local_funding_rates_dir)
     premium_dir = Path(cfg.local_premium_index_dir)
     sem = asyncio.Semaphore(max(1, max_concurrent))
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=max(300.0, float(cfg.timeout_s) * 2.0))
     funding_results: List[FundingCompareResult] = []
     premium_results: List[PremiumCompareResult] = []
     async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "backtest-pull-compare/1.0"}) as session:
@@ -537,6 +589,16 @@ def _month_str(day: date) -> str:
     return f"{day.year:04d}-{day.month:02d}"
 
 
+def _vision_http_timeout(timeout_s: float) -> aiohttp.ClientTimeout:
+    """Vision ZIP 可能较大；单独放宽 sock_read/total，减少读一半断开的假空数据。"""
+    ts = max(60.0, float(timeout_s))
+    return aiohttp.ClientTimeout(
+        sock_connect=30.0,
+        sock_read=min(300.0, ts * 2.5),
+        total=min(600.0, ts * 4.0),
+    )
+
+
 async def _fetch_vision_zip_csv_rows(
     session: "aiohttp.ClientSession",
     *,
@@ -551,34 +613,67 @@ async def _fetch_vision_zip_csv_rows(
     下载 data.binance.vision 的 ZIP（内含 CSV），返回 CSV rows（含 header）。
 
     注意：Vision 的 daily 文件在“刚生成/刚同步”阶段可能短暂 404，这里把 404 也纳入重试窗口；
+    对 429/502/503/504 及网络读错误做额外重试，减轻 CDN 限流与间歇断连导致的「全空 official」。
     若最终仍 404，则返回空列表（上层可决定是否 fallback 到 monthly）。
     """
     last_err: Optional[BaseException] = None
     base_attempts = max(1, int(retries))
     extra_404_attempts = max(0, int(extra_404_retries))
-    total_attempts = base_attempts + extra_404_attempts
-    for attempt in range(total_attempts):
+    total_404_attempts = base_attempts + extra_404_attempts
+    http_timeout = _vision_http_timeout(timeout_s)
+    not_found_count = 0
+    transient_count = 0
+    max_rounds = total_404_attempts + VISION_TRANSIENT_MAX_RETRIES + 12
+
+    for _ in range(max_rounds):
         try:
-            async with session.get(url, timeout=timeout_s) as resp:
+            async with session.get(url, timeout=http_timeout) as resp:
+                if resp.status in (429, 502, 503, 504):
+                    transient_count += 1
+                    if transient_count > VISION_TRANSIENT_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"HTTP {resp.status} from data.binance.vision (transient retries exhausted): {url}"
+                        )
+                    ra = resp.headers.get("Retry-After")
+                    try:
+                        wait_s = float(ra) if ra else float(retry_delay_s) * (2 ** min(transient_count, 5))
+                    except ValueError:
+                        wait_s = float(retry_delay_s) * (2 ** min(transient_count, 5))
+                    await asyncio.sleep(min(90.0, max(0.5, wait_s)))
+                    continue
                 if resp.status == 404:
-                    if attempt < total_attempts - 1:
-                        await asyncio.sleep(float(extra_404_retry_delay_s or retry_delay_s))
-                        continue
-                    return []
+                    not_found_count += 1
+                    if not_found_count >= total_404_attempts:
+                        return []
+                    await asyncio.sleep(float(extra_404_retry_delay_s or retry_delay_s))
+                    continue
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status} from data.binance.vision")
                 zcontent = await resp.read()
+            if not zcontent:
+                transient_count += 1
+                await asyncio.sleep(float(retry_delay_s) * (1.5 ** min(transient_count, 6)))
+                continue
             with zipfile.ZipFile(io.BytesIO(zcontent), "r") as zf:
                 names = zf.namelist()
                 if not names:
-                    return []
+                    transient_count += 1
+                    await asyncio.sleep(float(retry_delay_s))
+                    continue
                 with zf.open(names[0]) as f:
                     return list(csv.reader(io.TextIOWrapper(f)))
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, zipfile.BadZipFile, EOFError) as e:
+            last_err = e
+            transient_count += 1
+            if transient_count > VISION_TRANSIENT_MAX_RETRIES + total_404_attempts:
+                raise RuntimeError(f"Failed to fetch ZIP/CSV from data.binance.vision: {last_err}") from last_err
+            await asyncio.sleep(float(retry_delay_s) * (2 ** min(transient_count % 8, 5)))
         except Exception as e:
             last_err = e
-            if attempt < total_attempts - 1:
-                await asyncio.sleep(float(retry_delay_s) * (2 ** min(attempt, 4)))
-    raise RuntimeError(f"Failed to fetch ZIP/CSV from data.binance.vision: {last_err}") from last_err
+            raise RuntimeError(f"Failed to fetch ZIP/CSV from data.binance.vision: {last_err}") from last_err
+
+    err_msg = repr(last_err) if last_err else "max rounds exceeded"
+    raise RuntimeError(f"Failed to fetch ZIP/CSV from data.binance.vision: {err_msg}")
 
 
 def _load_universe_symbols(
@@ -672,24 +767,31 @@ def pull_universe_from_live(cfg: PullCompareConfig, target_day: Optional[date] =
     success = False
     
     try:
+        # 列出全部按日目录（新→旧）。勿用 head -N：若 target_day 很早，最近 N 日可能都晚于 target，导致永远拉不到 universe。
         result = subprocess.run(
             ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
              f"{cfg.live_user}@{cfg.live_host}",
-             f"ls -d {cfg.live_universe_dir}/????-??-?? 2>/dev/null | sort -r | head -10"],
-            capture_output=True, text=True, timeout=30
+             f"ls -d {cfg.live_universe_dir}/????-??-?? 2>/dev/null | sort -r"],
+            capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0 and result.stdout.strip():
-            date_dirs = result.stdout.strip().split('\n')
+            date_dirs = [ln.strip() for ln in result.stdout.strip().split("\n") if ln.strip()]
+            skipped_newer = 0
             for remote_date_dir in date_dirs:
                 date_name = Path(remote_date_dir).name
                 if target_day:
                     try:
                         dir_date = datetime.strptime(date_name, "%Y-%m-%d").date()
                         if dir_date > target_day:
-                            print(f"  Skipping {date_name} (newer than target {target_day})")
+                            skipped_newer += 1
                             continue
                     except ValueError:
                         continue
+                if skipped_newer and target_day:
+                    print(
+                        f"  Skipped {skipped_newer} remote universe date dir(s) newer than target {target_day}"
+                    )
+                    skipped_newer = 0  # print once
                 remote_csv = f"{remote_date_dir}/v1/universe.csv"
                 local_date_dir = local_universe_dir / date_name / "v1"
                 local_date_dir.mkdir(parents=True, exist_ok=True)
@@ -816,8 +918,12 @@ async def _fetch_official_5m_klines_from_vision(
     timeout_s: float,
     retries: int,
     retry_delay_s: float,
+    vision_404_retries: Optional[int] = None,
+    vision_404_retry_delay_s: Optional[float] = None,
 ) -> List[List[Any]]:
     """从 data.binance.vision 下载 5m klines ZIP"""
+    v404 = int(vision_404_retries if vision_404_retries is not None else VISION_404_RETRIES_DEFAULT)
+    vdelay = float(vision_404_retry_delay_s if vision_404_retry_delay_s is not None else VISION_404_RETRY_DELAY_S_DEFAULT)
     sym = format_symbol(symbol)
     day_str = day.isoformat()
     daily_url = f"{DATA_VISION_BASE}/data/futures/um/daily/klines/{sym}/5m/{sym}-5m-{day_str}.zip"
@@ -828,8 +934,8 @@ async def _fetch_official_5m_klines_from_vision(
         timeout_s=timeout_s,
         retries=retries,
         retry_delay_s=retry_delay_s,
-        extra_404_retries=VISION_404_RETRIES_DEFAULT,
-        extra_404_retry_delay_s=VISION_404_RETRY_DELAY_S_DEFAULT,
+        extra_404_retries=v404,
+        extra_404_retry_delay_s=vdelay,
     )
 
     # daily 不存在/未就绪 -> monthly fallback
@@ -844,6 +950,8 @@ async def _fetch_official_5m_klines_from_vision(
             timeout_s=timeout_s,
             retries=max(1, retries),
             retry_delay_s=retry_delay_s,
+            extra_404_retries=v404,
+            extra_404_retry_delay_s=vdelay,
         )
         if not mrows:
             return []
@@ -886,8 +994,12 @@ async def _fetch_agg_trades_from_vision(
     timeout_s: float,
     retries: int,
     retry_delay_s: float,
+    vision_404_retries: Optional[int] = None,
+    vision_404_retry_delay_s: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """从 data.binance.vision 下载 aggTrades ZIP"""
+    v404 = int(vision_404_retries if vision_404_retries is not None else VISION_404_RETRIES_DEFAULT)
+    vdelay = float(vision_404_retry_delay_s if vision_404_retry_delay_s is not None else VISION_404_RETRY_DELAY_S_DEFAULT)
     sym = format_symbol(symbol)
     day_str = day.isoformat()
     daily_url = f"{DATA_VISION_BASE}/data/futures/um/daily/aggTrades/{sym}/{sym}-aggTrades-{day_str}.zip"
@@ -898,8 +1010,8 @@ async def _fetch_agg_trades_from_vision(
         timeout_s=timeout_s,
         retries=retries,
         retry_delay_s=retry_delay_s,
-        extra_404_retries=VISION_404_RETRIES_DEFAULT,
-        extra_404_retry_delay_s=VISION_404_RETRY_DELAY_S_DEFAULT,
+        extra_404_retries=v404,
+        extra_404_retry_delay_s=vdelay,
     )
 
     if not rows:
@@ -913,6 +1025,8 @@ async def _fetch_agg_trades_from_vision(
             timeout_s=timeout_s,
             retries=max(1, retries),
             retry_delay_s=retry_delay_s,
+            extra_404_retries=v404,
+            extra_404_retry_delay_s=vdelay,
         )
         if not mrows:
             return []
@@ -1140,65 +1254,10 @@ def _compare_symbol_day(
 def _aggregate_agg_trades_to_klines(
     symbol: str, trades: List[Dict[str, Any]], interval_minutes: int = 5
 ) -> pd.DataFrame:
-    """从 aggTrade 列表批量聚合为 5m K线"""
-    if not trades:
-        return pd.DataFrame()
-    interval_seconds = interval_minutes * 60
-    by_window: Dict[int, List[Dict]] = {}
-    for t in trades:
-        ts_ms = int(t.get("T", 0))
-        if ts_ms <= 0:
-            continue
-        window_s = (ts_ms // 1000) // interval_seconds * interval_seconds
-        window_ms = window_s * 1000
-        if window_ms not in by_window:
-            by_window[window_ms] = []
-        by_window[window_ms].append(t)
-    rows = []
-    for window_ms, window_trades in sorted(by_window.items()):
-        if not window_trades:
-            continue
-        prices = []
-        volumes = []
-        quote_volumes = []
-        trade_count_underlying = 0
-        for t in window_trades:
-            p = float(t.get("p", 0))
-            q = float(t.get("q", 0))
-            qq = float(t.get("Q", 0))
-            if qq == 0:
-                qq = p * q
-            prices.append(p)
-            volumes.append(q)
-            quote_volumes.append(qq)
-            f_id = t.get("f")
-            l_id = t.get("l")
-            if f_id is not None and l_id is not None:
-                trade_count_underlying += max(1, int(l_id) - int(f_id) + 1)
-            else:
-                trade_count_underlying += 1
-        open_p = prices[0]
-        high_p = max(prices)
-        low_p = min(prices)
-        close_p = prices[-1]
-        volume = sum(volumes)
-        quote_volume = sum(quote_volumes)
-        window_dt = datetime.fromtimestamp(window_ms / 1000, tz=timezone.utc)
-        window_end_ms = window_ms + interval_minutes * 60 * 1000
-        close_dt = datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
-        rows.append({
-            "symbol": format_symbol(symbol),
-            "open_time": window_dt,
-            "close_time": close_dt,
-            "open": open_p,
-            "high": high_p,
-            "low": low_p,
-            "close": close_p,
-            "volume": volume,
-            "quote_volume": quote_volume,
-            "tradecount": trade_count_underlying,
-        })
-    return pd.DataFrame(rows)
+    """从 Vision aggTrade 列表聚合为 5m K 线（与实盘 ``KlineAggregator`` 内有成交窗口一致）。"""
+    return aggregate_vision_agg_trades_to_klines_dataframe(
+        symbol, trades, interval_minutes=interval_minutes
+    )
 
 
 def _save_klines_parquet(symbol: str, df: pd.DataFrame, day: date, klines_dir: Path) -> bool:
@@ -1282,40 +1341,77 @@ async def compare_klines_only(
     audit_dir: Optional[Path] = None,
 ) -> List[SymbolCompareResult]:
     """
-    对比官方 5m K线与本地数据，对比失败则下载 aggTrade 重新聚合覆盖
+    对比官方 5m K线与本地数据，对比失败则下载 aggTrade 重新聚合覆盖。
+    对 Vision 使用更长读超时、限并发连接，并在 official 短时为空时额外重试，减轻网络/CDN 抖动。
     """
     klines_dir = Path(cfg.local_klines_dir)
     sem = asyncio.Semaphore(max(1, int(max_concurrent or cfg.max_concurrent)))
-    timeout = aiohttp.ClientTimeout(total=cfg.timeout_s)
     results: List[SymbolCompareResult] = []
-    
-    headers = {"User-Agent": "Binance-Data-Vision/1.0"}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async def compare_one(sym: str) -> SymbolCompareResult:
-            async with sem:
-                remote_raw = await _fetch_official_5m_klines_from_vision(
-                    session, symbol=sym, day=day,
-                    timeout_s=cfg.timeout_s, retries=cfg.retries, retry_delay_s=cfg.retry_delay_s,
-                )
-            remote_df = _official_to_df(sym, remote_raw)
-            local_df = _load_local_kline_df(sym, day, klines_dir)
-            # 保存时间轴审计数据（理论/实际时间戳）
-            try:
-                if audit_dir is not None:
-                    _save_kline_timestamp_audit(
-                        symbol=sym,
-                        day=day,
-                        local_df=local_df,
-                        remote_df=remote_df,
-                        audit_root=audit_dir,
-                    )
-            except Exception as e:
-                print(f"Warning: failed saving timestamp audit for {sym}: {e}", file=sys.stderr)
 
-            return _compare_symbol_day(
-                symbol=sym, day=day, local_df=local_df, remote_df=remote_df, cfg=cfg
-            )
-        
+    headers = {"User-Agent": "Binance-Data-Vision/1.0"}
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=16, ttl_dns_cache=300, enable_cleanup_closed=True)
+    sess_timeout = aiohttp.ClientTimeout(
+        sock_connect=30.0,
+        sock_read=max(120.0, float(cfg.timeout_s) * 1.5),
+        total=None,
+    )
+    async with aiohttp.ClientSession(
+        timeout=sess_timeout, headers=headers, connector=connector
+    ) as session:
+        async def compare_one(sym: str) -> SymbolCompareResult:
+            try:
+                remote_df = pd.DataFrame()
+                remote_raw: List[List[Any]] = []
+                for empty_try in range(4):
+                    async with sem:
+                        remote_raw = await _fetch_official_5m_klines_from_vision(
+                            session,
+                            symbol=sym,
+                            day=day,
+                            timeout_s=cfg.timeout_s,
+                            retries=cfg.retries,
+                            retry_delay_s=cfg.retry_delay_s,
+                            vision_404_retries=cfg.vision_404_retries,
+                            vision_404_retry_delay_s=cfg.vision_404_retry_delay_s,
+                        )
+                    remote_df = _official_to_df(sym, remote_raw)
+                    if not remote_df.empty:
+                        break
+                    if empty_try < 3:
+                        await asyncio.sleep(1.0 * (2**empty_try))
+
+                local_df = _load_local_kline_df(sym, day, klines_dir)
+                try:
+                    if audit_dir is not None:
+                        _save_kline_timestamp_audit(
+                            symbol=sym,
+                            day=day,
+                            local_df=local_df,
+                            remote_df=remote_df,
+                            audit_root=audit_dir,
+                        )
+                except Exception as e:
+                    print(f"Warning: failed saving timestamp audit for {sym}: {e}", file=sys.stderr)
+
+                return _compare_symbol_day(
+                    symbol=sym, day=day, local_df=local_df, remote_df=remote_df, cfg=cfg
+                )
+            except Exception as e:
+                print(f"  Warning: kline compare failed for {sym}: {e}", file=sys.stderr)
+                return SymbolCompareResult(
+                    symbol=format_symbol(sym),
+                    day=str(day),
+                    ok=False,
+                    live_rows=0,
+                    binance_history_rows=0,
+                    missing_local=0,
+                    missing_remote=0,
+                    mismatched_rows=0,
+                    mismatch_ratio=1.0,
+                    max_ref_diff={},
+                    examples=[{"error": str(e)}],
+                )
+
         results = await asyncio.gather(*(compare_one(s) for s in symbols))
     return sorted(results, key=lambda r: r.symbol)
 
@@ -1331,7 +1427,13 @@ async def fix_klines_with_aggtrade(
         return
     print(f"Kline compare failed for {len(symbols)} symbols, downloading aggTrades to recompute...")
     headers = {"User-Agent": "Binance-Data-Vision/1.0"}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120.0), headers=headers) as session:
+    fix_timeout = aiohttp.ClientTimeout(
+        sock_connect=30.0,
+        sock_read=max(120.0, float(cfg.timeout_s) * 1.5),
+        total=None,
+    )
+    connector = aiohttp.TCPConnector(limit_per_host=12, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(timeout=fix_timeout, headers=headers, connector=connector) as session:
         for sym in symbols:
             try:
                 # 如果本地当天 K 线都不存在（Step1 未拉到），则没必要重算 aggTrades（也避免日志噪声）。
@@ -1340,8 +1442,14 @@ async def fix_klines_with_aggtrade(
                     continue
                 print(f"  Downloading aggTrades for {sym}...")
                 trades = await _fetch_agg_trades_from_vision(
-                    session, symbol=sym, day=day,
-                    timeout_s=cfg.timeout_s, retries=cfg.retries, retry_delay_s=cfg.retry_delay_s,
+                    session,
+                    symbol=sym,
+                    day=day,
+                    timeout_s=cfg.timeout_s,
+                    retries=cfg.retries,
+                    retry_delay_s=cfg.retry_delay_s,
+                    vision_404_retries=cfg.vision_404_retries,
+                    vision_404_retry_delay_s=cfg.vision_404_retry_delay_s,
                 )
                 if not trades:
                     print(f"    No aggTrades found for {sym}", file=sys.stderr)
@@ -1379,6 +1487,11 @@ async def _main_async(args: argparse.Namespace) -> int:
         local_premium_index_dir=args.local_premium_dir or str(config.get("data.premium_index_directory", "data/premium_index")),
         local_universe_dir=args.local_universe_dir or str(config.get("data.universe_directory", "data/universe")),
         max_concurrent=int(args.max_concurrent),
+        timeout_s=float(args.timeout_s),
+        retries=int(args.retries),
+        retry_delay_s=float(args.retry_delay_s),
+        vision_404_retries=int(args.vision_404_retries),
+        vision_404_retry_delay_s=float(args.vision_404_retry_delay_s),
     )
     
     if not cfg.live_host or not cfg.live_user:
@@ -1458,7 +1571,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     premium_live_ok = sum(1 for r in premium_live_results if r.ok)
     premium_live_fail = len(premium_live_results) - premium_live_ok
 
-    out_dir = Path(args.output_dir or DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR)
+    out_dir = Path(args.output_dir or default_backtest_compare_output_dir())
     ensure_directory(str(out_dir))
     live_report_path = out_dir / f"{day.isoformat()}.live.json"
     live_payload = {
@@ -1552,9 +1665,39 @@ def main() -> int:
     parser.add_argument("--local-universe-dir", help="Local universe directory path.")
     parser.add_argument("--max-concurrent", type=int, default=5)
     parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=120.0,
+        help="Per-request timeout budget for Vision ZIP reads (seconds). Default 120.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=5,
+        help="Base HTTP retries for each Vision URL (before 404 extra retries). Default 5.",
+    )
+    parser.add_argument(
+        "--retry-delay-s",
+        type=float,
+        default=1.0,
+        help="Base delay between retries (seconds). Default 1.0.",
+    )
+    parser.add_argument(
+        "--vision-404-retries",
+        type=int,
+        default=8,
+        help="Extra attempts when Vision returns 404 (daily not ready). Default 8.",
+    )
+    parser.add_argument(
+        "--vision-404-retry-delay-s",
+        type=float,
+        default=3.0,
+        help="Delay between 404 retries (seconds). Default 3.0.",
+    )
+    parser.add_argument(
         "--output-dir",
-        default=DEFAULT_BACKTEST_COMPARE_OUTPUT_DIR,
-        help="Report output dir.",
+        default=None,
+        help="Report output dir (default: data.backtest_compare_output_directory or compare/backtest_pull).",
     )
     parser.add_argument("--compare-only", action="store_true", help="Only compare, skip pulling data.")
     parser.add_argument("--print-fail", action="store_true", help="Print failed symbols and details.")
