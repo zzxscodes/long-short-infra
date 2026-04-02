@@ -1168,6 +1168,32 @@ def _log_validation_criteria(cfg: PullCompareConfig) -> None:
         print(f"    {f}: abs<={t.abs}, rel<={t.rel}")
 
 
+_KLINE_COMPARE_COLUMNS = [
+    "symbol",
+    "open_time_ms",
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "quote_volume",
+    "tradecount",
+]
+
+
+def _ensure_kline_df_for_merge(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    ``pd.DataFrame()`` 无列时 ``merge(..., on='open_time_ms')`` 会报 KeyError。
+    与 ``_load_local_kline_df`` 空表 schema 对齐，便于 outer merge。
+    """
+    if df is None:
+        return pd.DataFrame(columns=_KLINE_COMPARE_COLUMNS)
+    if df.empty and "open_time_ms" not in df.columns:
+        return pd.DataFrame(columns=_KLINE_COMPARE_COLUMNS)
+    return df
+
+
 def _compare_symbol_day(
     *,
     symbol: str,
@@ -1184,6 +1210,8 @@ def _compare_symbol_day(
     compare_fields = ["open", "high", "low", "close"]
     fields = compare_fields + ["tradecount"]
     tolerances = cfg.tolerances or {}
+    remote_df = _ensure_kline_df_for_merge(remote_df)
+    local_df = _ensure_kline_df_for_merge(local_df)
     merged = pd.merge(
         remote_df, local_df, on="open_time_ms", how="outer",
         suffixes=("_remote", "_local"), indicator=True,
@@ -1221,7 +1249,10 @@ def _compare_symbol_day(
         if row_bad:
             mismatched_rows += 1
             if len(examples) < max_examples:
-                open_sec = int(r["open_time_ms"])
+                try:
+                    open_sec = int(r["open_time_ms"])
+                except Exception:
+                    continue
                 examples.append({
                     "open_time_ms": open_sec,
                     "open_time": datetime.fromtimestamp(open_sec, tz=timezone.utc).isoformat(),

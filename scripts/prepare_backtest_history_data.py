@@ -5,15 +5,20 @@
 - **本脚本**：按 UTC 日批量从 data.binance.vision 拉取 funding / premium / aggTrade，
   用与实盘 ``data_layer`` / ``KlineAggregator`` 相同的 aggTrade→5m K 线聚合（经
   ``aggregate_vision_agg_trades_to_klines_dataframe``），写入本地目录并做官方 K 线校验。
-  **候选交易对**：优先 ``/fapi/v1/exchangeInfo`` + ``onboardDate``（UTC 日）。
-  若 fapi 不可达，则回退 **data.binance.vision** 上与官方一致的月度 5m K 线 ZIP 路径，对种子符号做 HEAD，
-  按 UTC 年月缓存（不 SSH、不从实盘拉 universe）。
+  **候选交易对（默认 ``--symbol-source exchange``）**：**每个 UTC 日单独**用
+  ``/fapi/v1/exchangeInfo`` + ``onboardDate`` 过滤出截至当日的池；若 fapi 不可达，则回退
+  **data.binance.vision** 月度 5m K 线 ZIP HEAD + 种子列表（按年月缓存）。
+  不再默认用「上一日落盘的 universe.csv」当候选池（``--symbol-source auto`` 才会那样），避免长区间里日复一日沿用旧列表。
 - **compare 脚本**：检测「最近」实盘落盘与官方是否一致，并修复本地；可依赖 SSH。
 
 二者共用 ``_compare_symbol_day``、Vision 拉取与 K 线聚合实现，保证口径一致。
 
 **完整性**：默认任一日 K 线对比存在 ``fail>0`` 时进程退出码为 **2**，并写入
 ``{start}_{end}.history_range_summary.json``；仅排查时可加 ``--allow-partial``。
+
+**断点续跑**：长区间任务中断后，可用 ``--resume``：若 ``{report_dir}/{YYYY-MM-DD}.history.json``
+已存在且其中 ``summary.klines.fail == 0``，则跳过该日（不重删 parquet、不重拉）。
+若某日曾有失败或未生成报告，仍会重新处理该日。
 """
 from __future__ import annotations
 
@@ -73,6 +78,23 @@ def _iter_days(start_day: date, end_day: date) -> List[date]:
         out.append(cur)
         cur += timedelta(days=1)
     return out
+
+
+def _history_report_day_fully_ok(report_path: Path) -> bool:
+    """
+    True if per-day history JSON exists and K-line compare had zero failures for that day.
+    Used by --resume to avoid re-deleting parquet and re-downloading completed days.
+    """
+    if not report_path.is_file():
+        return False
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+        summary = data.get("summary", {}).get("klines", {})
+        if "fail" not in summary:
+            return False
+        return int(summary["fail"]) == 0
+    except Exception:
+        return False
 
 
 # 进程内只拉一次 exchangeInfo，再按日历日过滤 onboardDate（history 按日换池）
@@ -309,9 +331,9 @@ async def _resolve_candidate_symbols_for_day(
 ) -> List[str]:
     """
     - ``symbol_source=universe``：仅用本地 ``<= target_day`` 的 universe.csv（无则空）。
-    - ``auto``：先尝试本地；不足 ``min_candidate_symbols`` 或为空时，用交易所 exchangeInfo
-      按 ``onboardDate`` 过滤出截至 ``target_day``（UTC）的池（不 SSH）。
-    - ``exchange``：始终用交易所按日过滤池。
+    - ``auto``：先尝试本地；不足 ``min_candidate_symbols`` 或为空时，才用交易所 / Vision
+      按 ``target_day`` 解析池。**若本地已有足够符号，不会按日刷新**（长区间 history 不推荐）。
+    - ``exchange``：**每个 target_day** 都用 exchangeInfo+onboardDate 或 Vision HEAD+seed 解析候选池（history 默认）。
     """
     api_base = str(config.get("execution.live.api_base", "https://fapi.binance.com"))
     symbols: List[str] = []
@@ -370,7 +392,6 @@ async def _prepare_one_day(
     timeout = aiohttp.ClientTimeout(total=90)
     headers = {"User-Agent": "history-prepare/1.0"}
 
-    universe_symbols: List[str] = []
     binance_kline_df_by_symbol: Dict[str, pd.DataFrame] = {}
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -386,21 +407,26 @@ async def _prepare_one_day(
                 )
             df = _official_to_df(sym, rows)
             if not df.empty:
-                universe_symbols.append(sym)
-                binance_kline_df_by_symbol[sym] = df
+                binance_kline_df_by_symbol[format_symbol(sym)] = df
 
         await asyncio.gather(*(load_kline_for_universe(s) for s in candidate_symbols))
 
-        universe_symbols = sorted(set(universe_symbols))
-        universe_csv = _save_universe_csv(Path(cfg.local_universe_dir), day, universe_symbols)
-        print(f"[{day}] universe generated: {len(universe_symbols)} symbols -> {universe_csv}")
+        # 当日 universe 与候选池一致：按「交易所/Vision 解析出的候选」落盘并全量跑 funding/premium/agg/对比。
+        # 官方日 K 仅填入 binance_kline_df_by_symbol；某 symbol 当日无日 K 则 remote 为空，对比可标 fail，但不从 universe 里剔除。
+        day_universe = sorted({format_symbol(s) for s in candidate_symbols})
+        universe_csv = _save_universe_csv(Path(cfg.local_universe_dir), day, day_universe)
+        print(
+            f"[{day}] universe generated: {len(day_universe)} symbols (official 5m day kline ok: "
+            f"{len(binance_kline_df_by_symbol)}/{len(day_universe)}) -> {universe_csv}",
+            flush=True,
+        )
 
         # 关键：每次生成某一天的回测数据前，清掉本地同一天可能残留的文件。
         # 避免历史残留导致：即使本次网络下载失败，仍拿到旧数据参与对比/通过判断。
         local_klines_dir = Path(cfg.local_klines_dir)
         local_funding_dir = Path(cfg.local_funding_rates_dir)
         local_premium_dir = Path(cfg.local_premium_index_dir)
-        for sym in universe_symbols:
+        for sym in day_universe:
             s = format_symbol(sym)
             (local_klines_dir / s / f"{day.isoformat()}.parquet").unlink(missing_ok=True)
             (local_funding_dir / s / f"{day.isoformat()}.parquet").unlink(missing_ok=True)
@@ -409,7 +435,7 @@ async def _prepare_one_day(
         results = []
 
         async def prepare_symbol(sym: str) -> None:
-            remote_df = binance_kline_df_by_symbol.get(sym, pd.DataFrame())
+            remote_df = binance_kline_df_by_symbol.get(format_symbol(sym), pd.DataFrame())
             try:
                 async with sem:
                     funding_df = await _fetch_funding_history(
@@ -477,7 +503,7 @@ async def _prepare_one_day(
                     )
                 )
 
-        await asyncio.gather(*(prepare_symbol(s) for s in universe_symbols))
+        await asyncio.gather(*(prepare_symbol(s) for s in day_universe))
 
     results = sorted(results, key=lambda x: x.symbol)
     ok = sum(1 for r in results if r.ok)
@@ -590,6 +616,14 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     days_with_kline_fail: List[str] = []
     for d in days:
+        day_report = report_dir / f"{d.isoformat()}.history.json"
+        if args.resume and _history_report_day_fully_ok(day_report):
+            print(
+                f"[{d}] skip (--resume: existing {day_report.name} has klines fail=0)",
+                flush=True,
+            )
+            continue
+
         if explicit_symbols is not None:
             symbols = explicit_symbols
         elif anchored_symbols is not None:
@@ -656,9 +690,10 @@ def main() -> int:
     parser.add_argument(
         "--symbol-source",
         choices=["auto", "universe", "exchange"],
-        default="auto",
-        help="auto=prefer local universe (<=day) if >=min-candidate else exchangeInfo+onboardDate for that UTC day; "
-        "universe=local CSV only; exchange=each day from exchangeInfo+onboardDate. No live SSH.",
+        default="exchange",
+        help="exchange (default)=each UTC day fresh pool from exchangeInfo+onboardDate or Vision HEAD+seed; "
+        "auto=prefer local universe (<=day) if >=min-candidate (may NOT refresh daily—avoid for long history); "
+        "universe=local CSV only. No live SSH.",
     )
     parser.add_argument("--min-candidate-symbols", type=int, default=50, help="If candidates below this threshold, fallback to other source.")
     parser.add_argument(
@@ -701,6 +736,12 @@ def main() -> int:
         "--allow-partial",
         action="store_true",
         help="Exit 0 even if some days have kline compare failures (default: exit 2 when any day has fail>0).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip a calendar day if report_dir/YYYY-MM-DD.history.json exists and summary.klines.fail is 0 "
+        "(avoids re-deleting parquet and re-downloading that day). Re-runs days with fail>0 or missing report.",
     )
     args = parser.parse_args()
     return asyncio.run(_main_async(args))
