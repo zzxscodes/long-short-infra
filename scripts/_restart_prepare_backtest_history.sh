@@ -23,9 +23,10 @@ find "$COMPARE_PULL" -maxdepth 1 \( -name '*.history.json' -o -name '*.history_r
 : > "$LOG"
 
 cd "$ROOT"
+# 并发：略高于 20 以加速；不宜过大以免 Vision/CDN 429（一般 32 内较稳，可按机器与网络再调）
 nohup env PYTHONUNBUFFERED=1 ./quant/bin/python3 -u scripts/prepare_backtest_history_data.py \
   --start-day 2022-12-31 --end-day 2026-02-28 \
-  --infer-universe-from-fetch --max-concurrent 20 \
+  --infer-universe-from-fetch --max-concurrent 32 \
   >> "$LOG" 2>&1 &
 echo $! | tee "$PID_FILE" | tee "$ROOT/logs/prepare_backtest_history.pid"
 sleep 6

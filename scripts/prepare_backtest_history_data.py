@@ -12,14 +12,20 @@ Vision 仅使用 ``data/futures/um/``（官方 UM 数据前缀），与上述 U 
   ``aggregate_vision_agg_trades_to_klines_dataframe``）写入本地目录；agg 为空时按官方 5m 时间轴
   写无成交 K 线（与实盘缺窗补线一致），再做官方 K 线校验。
 
-  **交易对来源（``--symbol-source exchange``，默认）**：**每个 UTC 日**单独解析 **U 本位永续全量**——
-  优先 ``/fapi/v1/exchangeInfo`` + ``onboardDate``；若 fapi 不可达，则从 **data.binance.vision**
-  S3 列举 ``data/futures/um/daily/klines/`` 下目录名，再对该列表做月度 5m ZIP HEAD 过滤（按年月缓存）。
-  不依赖任何本地种子文件。
+  **交易对来源（``--symbol-source exchange``，默认，非 infer）**：**每个 UTC 日**单独解析 **U 本位永续**——
+  优先 ``/fapi/v1/exchangeInfo`` + ``onboardDate``；若 fapi 不可达，则 Vision S3 列举 ``um/daily/klines/``
+  再对该列表做 **月度 5m ZIP HEAD** 过滤（按年月缓存）。
 
-**倒推 universe（``--infer-universe-from-fetch``）**：对每个 UTC 日按上述方式得到 **U 本位永续** 枚举，
-  拉 Vision 官方 5m，**非空**则计入当日 universe；忽略 ``--symbol-source``。可选 ``--symbols`` /
-  ``--symbol-limit`` 缩小范围。
+**``--infer-universe-from-fetch``（按日循环，仅与本日 K 有关）**：
+
+  对每个 UTC 日 ``D`` **独立**执行：
+
+  1. 得到当日 **探测池**（fapi+onboardDate 至 ``D``，或 fapi 不可达时用 S3 列举 ``um`` 目录；无月度 HEAD）。
+  2. **只查 ``D`` 这一天**的 Vision 官方 5m；整理出 **当日 K 非空** 的 symbol。
+  3. **universe = 上一步的 symbol 集合**（写入 ``universe/…/universe.csv``）。
+  4. 仅对 universe 内拉 funding / premium / agg、聚合、对比报告。
+
+  可选 ``--symbols`` / ``--symbol-limit`` 缩小探测池。忽略 ``--symbol-source``。
 
 - **compare 脚本**：检测「最近」实盘落盘与官方是否一致，并修复本地；可依赖 SSH。
 
@@ -410,6 +416,61 @@ def _save_trades_parquet(trades_dir: Path, symbol: str, day: date, trades: List[
     return p
 
 
+async def _fetch_official_5m_nonempty_map_for_day(
+    *,
+    day: date,
+    probe_symbols: Sequence[str],
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    cfg: PullCompareConfig,
+    show_progress: bool,
+    max_concurrent: int,
+) -> Dict[str, pd.DataFrame]:
+    """
+    仅针对 ``day`` 这一 UTC 日：对探测列表逐个拉 Vision **当日**官方 5m ZIP，
+    返回 ``symbol -> DataFrame``，**仅含非空 K**（空包或解析空则不出现）。
+
+    这是 infer 与后续对比的「按日查 K」唯一来源；**不按前一日 universe 推导当日**。
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    enum_list = [format_symbol(s) for s in probe_symbols]
+    total = len(enum_list)
+    kline_done = 0
+    kline_lock = asyncio.Lock()
+
+    async def load_one(sym: str) -> None:
+        nonlocal kline_done
+        async with sem:
+            rows = await _fetch_official_5m_klines_from_vision(
+                session,
+                symbol=sym,
+                day=day,
+                timeout_s=60.0,
+                retries=max(2, int(cfg.retries)),
+                retry_delay_s=float(cfg.retry_delay_s),
+            )
+        df = _official_to_df(sym, rows)
+        if not df.empty:
+            out[format_symbol(sym)] = df
+        async with kline_lock:
+            kline_done += 1
+            if show_progress and total > 0 and (kline_done % 40 == 0 or kline_done == total):
+                print(
+                    f"[{day}] {UM_USDT_PERPETUAL_LABEL} | official 5m(Vision) progress: "
+                    f"{kline_done}/{total} | nonempty: {len(out)}",
+                    flush=True,
+                )
+
+    if show_progress and total > 0:
+        print(
+            f"[{day}] step: 当日官方5m — {total} 个探测 symbol（本日 K 仅此一步；max_concurrent={max_concurrent}）…",
+            flush=True,
+        )
+
+    await asyncio.gather(*(load_one(s) for s in enum_list))
+    return out
+
+
 async def _prepare_one_day(
     *,
     day: date,
@@ -424,54 +485,27 @@ async def _prepare_one_day(
     timeout = aiohttp.ClientTimeout(total=90)
     headers = {"User-Agent": "history-prepare/1.0"}
 
-    binance_kline_df_by_symbol: Dict[str, pd.DataFrame] = {}
     enum_list = [format_symbol(s) for s in probe_symbols]
     total_enum = len(enum_list)
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        kline_done = 0
-        kline_lock = asyncio.Lock()
-
-        async def load_kline_for_universe(sym: str) -> None:
-            nonlocal kline_done
-            async with sem:
-                rows = await _fetch_official_5m_klines_from_vision(
-                    session,
-                    symbol=sym,
-                    day=day,
-                    timeout_s=60.0,
-                    retries=max(2, int(cfg.retries)),
-                    retry_delay_s=float(cfg.retry_delay_s),
-                )
-            df = _official_to_df(sym, rows)
-            if not df.empty:
-                binance_kline_df_by_symbol[format_symbol(sym)] = df
-            async with kline_lock:
-                kline_done += 1
-                if infer_universe_from_fetch and (
-                    kline_done % 40 == 0 or kline_done == total_enum
-                ):
-                    print(
-                        f"[{day}] {UM_USDT_PERPETUAL_LABEL} | official 5m(Vision) progress: "
-                        f"{kline_done}/{total_enum} | nonempty: {len(binance_kline_df_by_symbol)}",
-                        flush=True,
-                    )
-
-        if infer_universe_from_fetch and total_enum > 0:
-            print(
-                f"[{day}] pulling official 5m for {total_enum} {UM_USDT_PERPETUAL_LABEL} symbols "
-                f"(max_concurrent={max_concurrent})…",
-                flush=True,
-            )
-
-        await asyncio.gather(*(load_kline_for_universe(s) for s in enum_list))
+        # 按日：仅拉「本 UTC 日」Vision 官方 5m；map 内均为当日 K 非空。
+        binance_kline_df_by_symbol = await _fetch_official_5m_nonempty_map_for_day(
+            day=day,
+            probe_symbols=probe_symbols,
+            session=session,
+            sem=sem,
+            cfg=cfg,
+            show_progress=infer_universe_from_fetch,
+            max_concurrent=max_concurrent,
+        )
 
         if infer_universe_from_fetch:
+            # universe = 当日有官方 5m（非空）的 symbol，与探测池大小无关。
             day_universe = sorted(binance_kline_df_by_symbol.keys())
             universe_csv = _save_universe_csv(Path(cfg.local_universe_dir), day, day_universe)
             print(
-                f"[{day}] universe.csv ({UM_USDT_PERPETUAL_LABEL}) inferred from official 5m: "
-                f"{len(day_universe)}/{total_enum} -> {universe_csv}",
+                f"[{day}] step: 生成 universe.csv — 当日有K的 {len(day_universe)}/{total_enum} symbol -> {universe_csv}",
                 flush=True,
             )
             if not day_universe:
@@ -664,10 +698,18 @@ async def _main_async(args: argparse.Namespace) -> int:
         )
     else:
         _SYMBOL_POOL_MODE = "vision_s3"
-        print(
-            f"[history_prepare] fapi 不可用 — {UM_USDT_PERPETUAL_LABEL} 改为 Vision S3(um) + 月度 5m ZIP HEAD",
-            flush=True,
-        )
+        if args.infer_universe_from_fetch:
+            print(
+                "[history_prepare] fapi 不可用 — infer：探测池用 Vision S3(um) 目录列举；"
+                "按「当日」官方5m 非空生成 universe（无月度 ZIP HEAD）",
+                flush=True,
+            )
+        else:
+            print(
+                f"[history_prepare] fapi 不可用 — {UM_USDT_PERPETUAL_LABEL} 改为 "
+                "Vision S3(um) 列举 + 月度 5m ZIP HEAD",
+                flush=True,
+            )
 
     vhead = int(getattr(args, "vision_head_concurrent", 32))
 
@@ -731,9 +773,9 @@ async def _main_async(args: argparse.Namespace) -> int:
 
         if args.infer_universe_from_fetch:
             symbols = await _infer_probe_symbols_for_day(d)
+            src = "fapi+onboardDate→当日探测池" if _SYMBOL_POOL_MODE == "fapi" else "S3(um)目录→当日探测池"
             print(
-                f"[{d}] infer-universe | {UM_USDT_PERPETUAL_LABEL} | 枚举 {len(symbols)} | "
-                f"({'fapi+onboardDate' if _SYMBOL_POOL_MODE == 'fapi' else 'Vision S3(um) 目录全量'})",
+                f"[{d}] infer 按日循环 | 探测池 {len(symbols)} ({src})；universe=下一步「当日官方5m非空」",
                 flush=True,
             )
             if not symbols:
