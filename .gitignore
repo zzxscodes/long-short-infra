@@ -60,36 +60,12 @@ htmlcov/
 *.log
 test_output/
 
-# Data files (runtime data, but keep directory structure)
-data/klines/**/*.parquet
-data/trades/**/*.parquet
-data/funding_rates/**/*.parquet
-data/premium_index/**/*.parquet
-data/universe/**/*.parquet
-data/positions/*.json
-data/position_history/*.json
-data/universe/**/*.csv
-data/symbol_info/**/*.json
-data/signals/*.json
-data/equity_curve/**/*.json
-data/strategy_reports/**/*.json
-data/api_performance/**/*.json
-data/performance/**/*.json
-data/system.pids
-# Daily official compare output
-data/compare/
-# Backtest sync destinations (local copies of klines/funding_rates/premium_index)
-data/backtest_klines/**/*.parquet
-data/backtest_funding_rates/**/*.parquet
-data/backtest_premium_index/**/*.parquet
-# Corrupted parquet quarantine (storage.py)
-data/corrupted_parquet/
+# Data directories — 整棵不纳入 Git（运行时落盘、本地种子等）
+data/
+scripts/data/
+
 *.corrupted
 *.corrupted.parquet
-# Stress test output (temp_full_system_memory_stress.py uses data/stress_test/)
-data/stress_test/
-# Keep .empty files to preserve directory structure
-!data/**/.empty
 
 # Logs
 logs/**/*.log
