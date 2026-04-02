@@ -8,8 +8,8 @@
   aggTrade **经与实盘相同的 K 线聚合口径**（见 ``src.data.kline_aggregator.aggregate_vision_agg_trades_to_klines_dataframe``）
   重算并覆盖本地，保证回测侧与线上一致。
 - **prepare_backtest_history_data**：面向「长区间」的**纯历史回测数据准备**。无 SSH、不拉实盘，
-  仅依赖 Vision：按日生成 universe、拉 funding/premium/aggTrade、用同一套聚合写入本地目录，
-  并用 ``_compare_symbol_day`` 与官方 5m K 线做校验。
+  仅依赖 Vision；universe 默认为 Binance **U本位(USDT-M)永续**全量（与 ``fapi`` UM / Vision ``data/futures/um`` 一致）。
+  按日生成 universe、拉 funding/premium/aggTrade、同一套聚合写入本地；agg 为空时写无成交 K 线，再 ``_compare_symbol_day`` 对照官方 5m。
 
 设计约定（与定时任务一致）：
 - 在 **UTC 日历日 D 的 12:00** 执行（见 scripts/setup_backtest_compare_scheduler.py）。
@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+from collections import OrderedDict
 import io
 import json
 import math
@@ -62,6 +63,14 @@ from src.common.utils import ensure_directory, format_symbol
 from src.data.kline_aggregator import aggregate_vision_agg_trades_to_klines_dataframe
 
 DATA_VISION_BASE = "https://data.binance.vision"
+
+# 同一 (symbol, UTC 月) 的月度 5m ZIP 在「按日」扫历史时会重复请求；缓存解析后的 CSV 行，按日切片只过滤内存。
+_VISION_UM_MONTHLY_KLINES_RAW_CACHE: "OrderedDict[str, List[List[str]]]" = OrderedDict()
+_MAX_VISION_MONTHLY_KLINES_CACHE = 512
+
+
+def _monthly_klines_cache_key(sym: str, day: date) -> str:
+    return f"{format_symbol(sym)}|{_month_str(day)}"
 
 # 默认报告输出目录（prepare_backtest_history_data 与之保持一致，便于同一目录查看 *.json）
 def default_backtest_compare_output_dir() -> str:
@@ -938,21 +947,29 @@ async def _fetch_official_5m_klines_from_vision(
         extra_404_retry_delay_s=vdelay,
     )
 
-    # daily 不存在/未就绪 -> monthly fallback
+    # daily 不存在/未就绪 -> monthly fallback（同 symbol 同月只下 ZIP 一次，缓存全月 CSV 行再按日切片）
     if not rows:
-        murl = (
-            f"{DATA_VISION_BASE}/data/futures/um/monthly/klines/{sym}/5m/"
-            f"{sym}-5m-{_month_str(day)}.zip"
-        )
-        mrows = await _fetch_vision_zip_csv_rows(
-            session,
-            url=murl,
-            timeout_s=timeout_s,
-            retries=max(1, retries),
-            retry_delay_s=retry_delay_s,
-            extra_404_retries=v404,
-            extra_404_retry_delay_s=vdelay,
-        )
+        mkey = _monthly_klines_cache_key(sym, day)
+        if mkey in _VISION_UM_MONTHLY_KLINES_RAW_CACHE:
+            mrows = _VISION_UM_MONTHLY_KLINES_RAW_CACHE[mkey]
+            _VISION_UM_MONTHLY_KLINES_RAW_CACHE.move_to_end(mkey)
+        else:
+            murl = (
+                f"{DATA_VISION_BASE}/data/futures/um/monthly/klines/{sym}/5m/"
+                f"{sym}-5m-{_month_str(day)}.zip"
+            )
+            mrows = await _fetch_vision_zip_csv_rows(
+                session,
+                url=murl,
+                timeout_s=timeout_s,
+                retries=max(1, retries),
+                retry_delay_s=retry_delay_s,
+                extra_404_retries=v404,
+                extra_404_retry_delay_s=vdelay,
+            )
+            while len(_VISION_UM_MONTHLY_KLINES_RAW_CACHE) >= _MAX_VISION_MONTHLY_KLINES_CACHE:
+                _VISION_UM_MONTHLY_KLINES_RAW_CACHE.popitem(last=False)
+            _VISION_UM_MONTHLY_KLINES_RAW_CACHE[mkey] = mrows
         if not mrows:
             return []
 
@@ -1203,6 +1220,10 @@ def _compare_symbol_day(
     cfg: PullCompareConfig,
     max_examples: int = 5,
 ) -> SymbolCompareResult:
+    """
+    对比官方 5m（remote）与本地（local）。local 可为 agg 聚合结果，也可为与实盘一致的无成交占位 K 线
+    （``_build_no_trade_klines_aligned_to_official``）；判定逻辑相同：outer merge + 容差。
+    """
     # 线上质量判断重点：回测主要依赖 OHLC 的价格轴一致性。
     # volume/quote_volume 在 Vision 与本地聚合时会出现微小（甚至略偏大的）四舍五入差异，
     # 若把它也纳入“全量失败”判定，会导致大量无意义的重算。
@@ -1289,6 +1310,54 @@ def _aggregate_agg_trades_to_klines(
     return aggregate_vision_agg_trades_to_klines_dataframe(
         symbol, trades, interval_minutes=interval_minutes
     )
+
+
+def _build_no_trade_klines_aligned_to_official(
+    symbol: str,
+    remote_df: pd.DataFrame,
+    *,
+    interval_minutes: int = 5,
+) -> pd.DataFrame:
+    """
+    Vision agg 聚合结果为空时，与实盘 ``DataLayer._build_empty_kline_row`` / 缺窗补线一致：
+    按官方 5m 时间轴为每个 ``open_time_ms`` 写一根「无成交」K 线（OHLC 平在锚定价、volume/tradecount 为 0）。
+
+    锚定价：取官方当日**排序后首根**的 open（无前一日本地/存储时，与补线逻辑中「段首参考价」一致）。
+    与官方 OHLC 逐根对比时仍可能因价位漂移产生 mismatch；但不再出现「本地整段缺失」类 missing_local。
+    """
+    remote_df = _ensure_kline_df_for_merge(remote_df)
+    if remote_df.empty or "open_time_ms" not in remote_df.columns:
+        return pd.DataFrame()
+    sym = format_symbol(symbol)
+    r = remote_df.sort_values("open_time_ms").reset_index(drop=True)
+    try:
+        anchor = float(r.iloc[0]["open"])
+    except (TypeError, ValueError):
+        anchor = 0.0
+    rows: List[Dict[str, Any]] = []
+    delta = timedelta(minutes=interval_minutes)
+    for _, row in r.iterrows():
+        try:
+            ot_sec = int(row["open_time_ms"])
+        except (TypeError, ValueError):
+            continue
+        window_dt = datetime.fromtimestamp(ot_sec, tz=timezone.utc)
+        close_dt = window_dt + delta
+        rows.append(
+            {
+                "symbol": sym,
+                "open_time": window_dt,
+                "close_time": close_dt,
+                "open": anchor,
+                "high": anchor,
+                "low": anchor,
+                "close": anchor,
+                "volume": 0.0,
+                "quote_volume": 0.0,
+                "tradecount": 0,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _save_klines_parquet(symbol: str, df: pd.DataFrame, day: date, klines_dir: Path) -> bool:
@@ -1472,6 +1541,17 @@ async def fix_klines_with_aggtrade(
                 if not _has_local_day_parquet(cfg.local_klines_dir, sym, day):
                     continue
                 print(f"  Downloading aggTrades for {sym}...")
+                remote_raw = await _fetch_official_5m_klines_from_vision(
+                    session,
+                    symbol=sym,
+                    day=day,
+                    timeout_s=cfg.timeout_s,
+                    retries=cfg.retries,
+                    retry_delay_s=cfg.retry_delay_s,
+                    vision_404_retries=cfg.vision_404_retries,
+                    vision_404_retry_delay_s=cfg.vision_404_retry_delay_s,
+                )
+                remote_df = _official_to_df(sym, remote_raw)
                 trades = await _fetch_agg_trades_from_vision(
                     session,
                     symbol=sym,
@@ -1482,12 +1562,14 @@ async def fix_klines_with_aggtrade(
                     vision_404_retries=cfg.vision_404_retries,
                     vision_404_retry_delay_s=cfg.vision_404_retry_delay_s,
                 )
-                if not trades:
-                    print(f"    No aggTrades found for {sym}", file=sys.stderr)
-                    continue
                 klines_df = _aggregate_agg_trades_to_klines(sym, trades)
+                if klines_df.empty and not remote_df.empty:
+                    klines_df = _build_no_trade_klines_aligned_to_official(sym, remote_df)
                 if klines_df.empty:
-                    print(f"    No klines from aggTrades for {sym}", file=sys.stderr)
+                    print(
+                        f"    No klines for {sym} (agg empty and no official grid)",
+                        file=sys.stderr,
+                    )
                     continue
                 if _save_klines_parquet(sym, klines_df, day, klines_dir):
                     print(f"    Recomputed {sym}: {len(klines_df)} bars aggregated from {len(trades)} trades")
