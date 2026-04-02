@@ -126,7 +126,9 @@ data:
   incomplete_symbols_log_interval: 5.0  # 不完整symbol日志记录间隔（秒）
   strict_data_completeness: true  # 严格完整性：币种覆盖必须与universe一致
   strict_funding_min_points_3d: 9  # 最近3天资金费率最小条数（3天*每天3次）
-  strict_premium_min_points_3d: 864  # 最近3天溢价指数最小条数（3天*288）
+  strict_premium_min_points_3d: 864  # 参考：3天*288（周期完整性已与 klines 对齐为24h窗口）
+  strict_premium_min_points_24h: 288  # 溢价指数周期完整性：与 klines 相同窗口（最近24h已结算5m）
+  premium_min_points_24h: 288  # 非 strict 模式下溢价 24h 最小根数
   strict_kline_min_points_24h: 288  # 最近24小时5min K线最小条数（严格288）
 
   # 官方K线对齐（默认关闭；优先修复聚合链路本身）

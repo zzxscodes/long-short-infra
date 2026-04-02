@@ -151,9 +151,16 @@ class DataLayerProcess:
         )  # 3天*每天3次资金费率
         self.strict_premium_min_points_3d = int(
             config.get('data.strict_premium_min_points_3d', 864)
-        )  # 3天*24h*12(5min)
+        )  # 3天*288；启动回填「是否需拉历史」仍可参考
         self.strict_kline_min_points_24h = int(
             config.get('data.strict_kline_min_points_24h', 288)
+        )
+        # 溢价指数周期完整性：与 klines 对齐为「最近24h已结算5m」窗口
+        self.strict_premium_min_points_24h = int(
+            config.get(
+                'data.strict_premium_min_points_24h',
+                config.get('data.strict_kline_min_points_24h', 288),
+            )
         )
 
         # WebSocket 实时资金费率缓冲（FundingMarketCollector 回调写入，_periodic_save 刷盘）
@@ -1402,22 +1409,21 @@ class DataLayerProcess:
             symbols_to_collect = []
             existing_count = 0
             
-            required_premium_points = (
-                self.strict_premium_min_points_3d
-                if self.strict_data_completeness
-                else int(config.get('data.premium_min_points_recent_window', 100))
-            )
+            settled_5m = self._floor_to_5m(datetime.now(timezone.utc))
+            recent_24h_start = settled_5m - timedelta(days=1)
             for symbol in symbols:
-                # 检查该交易对是否已有数据（检查最近3天的数据，确保有最新数据）
-                recent_end_time = datetime.now(timezone.utc)
-                recent_start_time = recent_end_time - timedelta(days=3)
-                existing_data = self.storage.load_premium_index_klines(symbol, recent_start_time, recent_end_time)
-                if existing_data.empty or len(existing_data) < required_premium_points:
+                missing_n = self._count_missing_premium_windows_for_range(
+                    symbol, recent_24h_start, settled_5m
+                )
+                if missing_n > 0:
                     symbols_to_collect.append(symbol)
-                    logger.debug(f"{symbol} needs premium index collection: recent_data={len(existing_data)}")
+                    logger.debug(
+                        f"{symbol} needs premium index collection: missing_5m_windows={missing_n} "
+                        f"in [{recent_24h_start}, {settled_5m})"
+                    )
                 else:
                     existing_count += 1
-                    logger.debug(f"{symbol} has recent premium index data: {len(existing_data)} records")
+                    logger.debug(f"{symbol} has complete premium index for last 24h settled 5m")
             
             if existing_count > 0:
                 logger.info(f"Found existing premium index data for {existing_count} symbols, skipping collection")
@@ -1639,6 +1645,51 @@ class DataLayerProcess:
                 missing += 1
         return missing
 
+    def _count_missing_premium_windows_for_range(
+        self, symbol: str, start_time: datetime, end_time: datetime
+    ) -> int:
+        """与 _count_missing_kline_windows_for_range 相同口径：统计 [start,end) 内缺失的 5m 根数。"""
+        p_df = self.storage.load_premium_index_klines(symbol, start_time, end_time)
+        total = int((end_time - start_time).total_seconds() // 300)
+        if total <= 0:
+            return 0
+        if p_df.empty:
+            return total
+        p_df = p_df.copy()
+        p_df["open_time"] = pd.to_datetime(p_df["open_time"], utc=True, errors="coerce")
+        p_df = (
+            p_df.dropna(subset=["open_time"])
+            .drop_duplicates(subset=["open_time"], keep="last")
+            .sort_values("open_time")
+        )
+        p_df = p_df[(p_df["open_time"] >= start_time) & (p_df["open_time"] < end_time)]
+        existing = set(p_df["open_time"].tolist())
+        missing = 0
+        for i in range(total):
+            ts = start_time + timedelta(minutes=5 * i)
+            if ts not in existing:
+                missing += 1
+        return missing
+
+    def _build_empty_premium_row(self, symbol: str, open_dt: datetime, prev_close: float) -> dict:
+        """与栅格补齐一致结构的溢价指数空行（前值填充）。"""
+        close_ts = open_dt + timedelta(minutes=5) - timedelta(milliseconds=1)
+        pc = float(prev_close)
+        return {
+            "symbol": symbol,
+            "open_time": open_dt,
+            "open": pc,
+            "high": pc,
+            "low": pc,
+            "close": pc,
+            "volume": 0.0,
+            "close_time": close_ts,
+            "quote_volume": 0.0,
+            "trade_count": 0,
+            "taker_buy_base_volume": 0.0,
+            "taker_buy_quote_volume": 0.0,
+        }
+
     @staticmethod
     def _build_expected_funding_times(start_time: datetime, end_time: datetime) -> List[datetime]:
         out: List[datetime] = []
@@ -1834,6 +1885,61 @@ class DataLayerProcess:
 
         return patched_symbols, patched_windows
 
+    async def _backfill_missing_premium_windows(
+        self, symbols: List[str], start_time: datetime, end_time: datetime
+    ) -> tuple[int, int]:
+        """与 _backfill_missing_kline_windows 对齐：最近24h 已结算 5m 窗口内缺洞用前值填空行并落盘。"""
+        patched_symbols = 0
+        patched_windows = 0
+        for symbol in symbols:
+            try:
+                hist_start = start_time - timedelta(days=1)
+                p_df = self.storage.load_premium_index_klines(symbol, hist_start, end_time)
+                if p_df.empty:
+                    working = pd.DataFrame(columns=["open_time", "close"])
+                else:
+                    working = p_df.copy()
+                    working["open_time"] = pd.to_datetime(
+                        working["open_time"], utc=True, errors="coerce"
+                    )
+                    if "close" in working.columns:
+                        working["close"] = pd.to_numeric(working["close"], errors="coerce")
+                    else:
+                        working["close"] = 0.0
+                    working = (
+                        working.dropna(subset=["open_time"])
+                        .drop_duplicates(subset=["open_time"], keep="last")
+                        .sort_values("open_time")
+                    )
+
+                existing = set(
+                    working[
+                        (working["open_time"] >= start_time)
+                        & (working["open_time"] < end_time)
+                    ]["open_time"].tolist()
+                )
+                total = int((end_time - start_time).total_seconds() // 300)
+                new_rows: List[dict] = []
+                for i in range(total):
+                    open_dt = start_time + timedelta(minutes=5 * i)
+                    if open_dt in existing:
+                        continue
+                    prev = working[working["open_time"] < open_dt]
+                    prev_close = float(prev.iloc[-1]["close"]) if not prev.empty else 0.0
+                    new_rows.append(self._build_empty_premium_row(symbol, open_dt, prev_close))
+                    working = pd.concat(
+                        [working, pd.DataFrame([{"open_time": open_dt, "close": float(prev_close)}])],
+                        ignore_index=True,
+                    )
+                if new_rows:
+                    self.storage.save_premium_index_klines(symbol, pd.DataFrame(new_rows))
+                    patched_symbols += 1
+                    patched_windows += len(new_rows)
+            except Exception as e:
+                logger.error(f"Failed to backfill premium index windows for {symbol}: {e}", exc_info=True)
+
+        return patched_symbols, patched_windows
+
     async def _check_and_complete_data(self):
         """定期检查数据完整性并自动补全缺失数据（每1小时检查一次）"""
         # 启动后尽快执行首轮完整性修复，避免清库重启后长时间存在“缺口未补”
@@ -1961,63 +2067,57 @@ class DataLayerProcess:
                             f"patched_points={patched_points}, range=[{recent_start_time}, {settled_funding_end})"
                         )
                 
-                # 2. 检查溢价指数K线数据完整性
+                # 2. 溢价指数：与 K 线同一窗口与缺洞逻辑（最近24h已结算5m；不触发 data_complete）
                 if self.premium_index_collector:
-                    missing_premium_index = []
-                    settled_5m_end = self._floor_to_5m(end_time)
-                    recent_start_time = settled_5m_end - timedelta(days=3)
-                    
-                    required_premium_points = (
-                        self.strict_premium_min_points_3d
+                    required_premium_24h = (
+                        self.strict_premium_min_points_24h
                         if self.strict_data_completeness
-                        else int(config.get('data.premium_min_points_recent_window', 100))
-                    )
-                    for symbol in symbols:
-                        existing_data = self.storage.load_premium_index_klines(
-                            symbol, recent_start_time, settled_5m_end
-                        )
-                        if existing_data.empty or len(existing_data) < required_premium_points:
-                            missing_premium_index.append(symbol)
-                    
-                    if missing_premium_index:
-                        logger.warning(f"Found {len(missing_premium_index)} symbols with missing premium index data, auto-completing...")
-                        # 采集最近7天的数据以确保完整性
-                        start_time = settled_5m_end - timedelta(days=7)
-                        max_concurrent = config.get('data.history_collect_max_concurrent', 5)
-                        batch_size = config.get('data.history_collect_batch_size', 25)
-                        saved_count = 0
-                        for i in range(0, len(missing_premium_index), batch_size):
-                            batch_symbols = missing_premium_index[i:i + batch_size]
-                            premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
-                                symbols=batch_symbols,
-                                start_time=start_time,
-                                end_time=settled_5m_end,
-                                interval='5m',
-                                max_concurrent=max_concurrent
+                        else int(
+                            config.get(
+                                "data.premium_min_points_24h",
+                                config.get("data.kline_min_points_24h", 288),
                             )
-                            for symbol, df in premium_index_map.items():
-                                if not df.empty:
-                                    try:
-                                        self.storage.save_premium_index_klines(symbol, df)
-                                        saved_count += 1
-                                    except Exception as e:
-                                        logger.error(f"Failed to save premium index klines for {symbol} during auto-completion: {e}")
-                            del premium_index_map
-                            import gc
-                            gc.collect()
-                        
-                        logger.info(f"Auto-completed premium index data for {saved_count}/{len(missing_premium_index)} symbols")
-                    # 强制按已结算5m时间栅格补齐（不能缺点）
-                    patched_symbols, patched_points = self._ensure_premium_grid_complete(
-                        symbols=symbols,
-                        start_time=recent_start_time,
-                        end_time=settled_5m_end,
-                    )
-                    if patched_points > 0:
-                        logger.info(
-                            f"Premium settled-grid backfill completed: patched_symbols={patched_symbols}, "
-                            f"patched_points={patched_points}, range=[{recent_start_time}, {settled_5m_end})"
                         )
+                    )
+                    missing_premium_index: List[str] = []
+                    short_premium_index: List[str] = []
+                    for symbol in symbols:
+                        missing_count = self._count_missing_premium_windows_for_range(
+                            symbol, recent_24h_start, settled_5m_end
+                        )
+                        if missing_count >= required_premium_24h:
+                            missing_premium_index.append(symbol)
+                            continue
+                        if missing_count > 0:
+                            short_premium_index.append(symbol)
+
+                    if missing_premium_index or short_premium_index:
+                        logger.warning(
+                            f"Found premium index completeness issues (24h settled 5m, aligned with klines): "
+                            f"missing={len(missing_premium_index)}, short={len(short_premium_index)}, "
+                            f"required_24h_points={required_premium_24h}. "
+                            f"missing_sample={missing_premium_index[:5]}, short_sample={short_premium_index[:5]}"
+                        )
+                        patched_sym_p, patched_win_p = await self._backfill_missing_premium_windows(
+                            symbols=symbols,
+                            start_time=recent_24h_start,
+                            end_time=settled_5m_end,
+                        )
+                        logger.info(
+                            f"Premium index hole backfill completed: patched_symbols={patched_sym_p}, "
+                            f"patched_windows={patched_win_p}, range=[{recent_24h_start}, {settled_5m_end})"
+                        )
+                        # 栅格兜底（与 kline 侧「空窗补齐后再压一遍」一致）
+                        patched_symbols, patched_points = self._ensure_premium_grid_complete(
+                            symbols=symbols,
+                            start_time=recent_24h_start,
+                            end_time=settled_5m_end,
+                        )
+                        if patched_points > 0:
+                            logger.info(
+                                f"Premium settled-grid backfill completed: patched_symbols={patched_symbols}, "
+                                f"patched_points={patched_points}, range=[{recent_24h_start}, {settled_5m_end})"
+                            )
                 
                 logger.info("Data integrity check completed")
                 # 首轮完成后，按配置间隔复查
